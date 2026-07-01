@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <!-- warm amber/orange body gradient: top #ffc24d -> bottom #fb8c00 -->
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffc24d"/>
+      <stop offset="1" stop-color="#fb8c00"/>
+    </linearGradient>
+    <!-- upper glossy highlight -->
+    <radialGradient id="gloss" cx="0.5" cy="0.30" r="0.62">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- tight soft drop shadow -->
+    <filter id="ds" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#a64b00" flood-opacity="0.40"/>
+    </filter>
+  </defs>
+
+  <!-- circle is dead-centered at (128,128); leave room for shadow + ring -->
+  <g filter="url(#ds)">
+    <!-- slightly-darker-orange outer ring -->
+    <circle cx="128" cy="128" r="104" fill="#e07600"/>
+    <!-- gradient body -->
+    <circle cx="128" cy="128" r="96" fill="url(#body)"/>
+    <!-- glossy highlight on upper part -->
+    <circle cx="128" cy="128" r="96" fill="url(#gloss)"/>
+  </g>
+
+  <!-- bold pure-white plus, PERFECTLY centered on (128,128) -->
+  <!-- arm length 2*54=108, thickness 32, equal margins all sides -->
+  <g fill="#ffffff">
+    <rect x="112" y="74"  width="32" height="108" rx="12"/>
+    <rect x="74"  y="112" width="108" height="32" rx="12"/>
+  </g>
+</svg>

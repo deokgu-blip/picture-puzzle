@@ -1,0 +1,4322 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Picture Puzzle — Swap (POC)</title>
+<style>
+  :root{
+    /* dark teal → green page gradient (reference HUD background) */
+    --bg-top:#0e4f47; --bg-bottom:#0a2f29;
+    --gridline:#0a3a33;             /* dark bg showing through tile gaps */
+    --hud-text:#ffffff; --hud-dim:#bfe6dd;
+    --accent:#34d399;               /* green accent (gear / next) */
+    --badge:#ef4444;                /* hint count badge (red) */
+    --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
+  }
+  /* kill the iOS long-press magnifier/loupe + text selection/copy callout everywhere (user req
+     2026-06-30): -webkit-touch-callout:none stops the loupe + "Copy" menu; user-select:none stops
+     selection (so no copy toggle on Android either). Applied globally — a puzzle game never needs
+     text selection. The game's own touch/drag still works (these don't affect pointer events). */
+  *{ box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent;
+     -webkit-touch-callout:none; -webkit-user-select:none; -moz-user-select:none; -ms-user-select:none; user-select:none; }
+  img{ -webkit-user-drag:none; user-drag:none; }
+  html,body{ height:100%; overflow:hidden; background:var(--bg-bottom);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    user-select:none; -webkit-user-select:none; touch-action:none; color:var(--hud-text); }
+
+  /* full-window background fills any letterbox (uniform, no bands) */
+  #bg{ position:fixed; inset:0; z-index:0;
+    background:linear-gradient(180deg,var(--bg-top) 0%, var(--bg-bottom) 100%); }
+
+  /* fixed portrait design box, centered */
+  #stage{
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    width:100vw; height:100vh; height:100dvh;            /* dvh = visible viewport (excludes mobile toolbar → no bottom cut-off) */
+    max-width:56.25vh; max-width:56.25dvh; max-height:177.78vw;
+    overflow:hidden; z-index:1; display:flex; flex-direction:column;
+  }
+
+  /* GAMEREELS: fill the FULL device screen. CRITICAL: use 100vh (STABLE large-viewport), NOT 100dvh —
+     iOS recalculates dvh during animations, which re-fits/shifts the board every time → the grid
+     "jumps" mid-merge regardless of level/arrangement (the regression vs the old vw-capped layout).
+     vh + the vh-based paddings below are all stable, so the board never moves on a dvh recalc. */
+  body.gamereels #stage{
+    left:0; top:0; transform:none;
+    width:100vw; height:100vh;
+    max-width:none; max-height:none;
+  }
+  /* Header (Level# + hint) lower + always the TOP layer (above board/deck/glow) so the gravity deck
+     can pass UNDER it. Grid pushed lower by a FIXED top offset, top-anchored (flex-start, NOT
+     align-items:center — centering re-anchors the board when iOS recalculates 100dvh mid-animation,
+     making the grid jump; flex-start keeps it put). */
+  body.gamereels #hud-top{ padding-top: calc(12.5vh + var(--safe-t)); z-index:20; }
+  body.gamereels #board-wrap{ align-items:flex-start; padding-top:6vh; }
+  /* GRAVITY: float the header (out of flex flow) so the tall deck+play board uses the FULL height;
+     the stacked deck may overlap the header — that's fine, the header sits on top (z-index:20). */
+  body.gamereels.gravmode #hud-top{ position:absolute; left:0; right:0; top:0; }
+  body.gamereels.gravmode #board-wrap{ padding-top:0; }
+  /* result screen: lift the Next button well UP from the bottom (user req: "위쪽으로 많이 올려줘") */
+  body.gamereels #overlay{ padding-bottom: 26%; }
+
+  /* ── top HUD: gear · Level N · hint bulb (+ badge) ── */
+  #hud-top{ position:relative; z-index:5; width:100%; transition:opacity .3s;
+    padding:calc(14px + var(--safe-t)) 22px 6px;
+    display:flex; align-items:center; justify-content:space-between; }
+  .hud-spacer{ width:54px; height:54px; }    /* matches .hud-btn — balances the HUD so the label stays centered */
+  .hud-btn{ width:54px; height:54px; border-radius:16px; border:none; cursor:pointer;
+    background:#ffffff; display:flex; align-items:center; justify-content:center;
+    position:relative; box-shadow:0 4px 10px rgba(0,0,0,.28); }
+  .hud-btn svg{ width:30px; height:30px; display:block; }
+  .hud-btn .badge{ position:absolute; top:-6px; right:-6px; min-width:22px; height:22px;
+    padding:0 5px; border-radius:11px; background:var(--badge); color:#fff;
+    font-weight:900; font-size:13px; line-height:22px; text-align:center;
+    border:2px solid #0e4f47; }
+  /* "buy more hints" state (0 hints): a generated round amber "+" icon, perfectly centered
+     (replaces the off-center text "+"). The icon carries its own ring/gloss/shadow. */
+  .hud-btn .badge.plus{ background:url(assets/ui/hint_plus.png) center/contain no-repeat;
+    border:none; box-shadow:none; color:transparent; text-indent:-9999px;
+    padding:0; width:30px; height:30px; min-width:30px; top:-9px; right:-9px; }
+  #level-label{ text-align:center; line-height:1.05; }
+  #level-label .cap{ font-size:18px; font-weight:800; letter-spacing:.5px; color:var(--hud-dim); }
+  #level-label .num{ font-size:34px; font-weight:900; color:var(--hud-text); margin-top:1px;
+    text-shadow:0 2px 4px rgba(0,0,0,.35); }
+
+  /* board area fills remaining space; canvas centered square-ish */
+  #board-wrap{ position:relative; flex:1 1 auto; min-height:0;
+    display:flex; align-items:flex-start; justify-content:center; padding-top:4px; }   /* grid starts right below the HUD (user ref) */
+  #board{ display:block; position:relative; z-index:2;
+    touch-action:none; -webkit-touch-callout:none; }
+  /* the floating (dragged) tile is a separate canvas moved by transform only */
+  #drag{ position:absolute; left:0; top:0; z-index:6; pointer-events:none;
+    display:none; will-change:transform; }
+  /* pop/glow overlay — covers the board-wrap so an enlarging (fused/cleared) block draws ABOVE
+     the grid and is NEVER clipped by the board canvas edge (user req: higher layer than grid). */
+  #popfx{ position:absolute; left:0; top:0; z-index:5; pointer-events:none; display:block; }
+
+  /* completion result screen: "Congratulations!" ribbon (top) + framed photo + coin & Next (bottom) */
+  #overlay{ position:absolute; inset:0; z-index:8; display:none;
+    flex-direction:column; align-items:center; justify-content:space-between;
+    padding:calc(40px + 8.5% + var(--safe-t)) 0 4%; pointer-events:none; }   /* clears the top-right coin HUD (ribbon sits below it, per ref) */
+  /* FLAT "Congratulations!" text (user ref): no 3D/gloss/ribbon — clean bold text, sits near the top */
+  #ribbon{ font-size:34px; font-weight:900; font-style:italic; color:#fff; white-space:nowrap;
+    text-shadow:0 2px 6px rgba(0,0,0,.35);
+    transform:translateY(-44px) scale(.7); opacity:0; }
+  /* looping montage of cleared pictures — fills the middle band, never blocks taps */
+  #montage{ position:absolute; left:0; right:0; z-index:8; pointer-events:none;
+    width:100%; display:none; }
+  #result-bottom{ display:flex; flex-direction:column; align-items:center; gap:13px; }
+  /* earned-coin pill — ABSOLUTE, JS-placed to STRADDLE the photo's bottom edge (user ref IMG_3302) */
+  #reward{ position:absolute; left:0; top:0; z-index:9; transform-origin:center;
+    display:flex; align-items:center; gap:7px; font-size:23px; font-weight:900; color:#fff;
+    padding:6px 18px; border-radius:22px; background:rgba(0,0,0,.45);
+    text-shadow:0 2px 3px rgba(0,0,0,.4); transform:translate(-50%,-100%) scale(.4); opacity:0; }
+  #reward .coin{ width:30px; height:30px; display:block;
+    filter:drop-shadow(0 1px 2px rgba(0,0,0,.45)); }
+  /* gold "NEXT" button image — transparent button, image is the content */
+  /* FLAT button (user ref): solid amber pill, white text, NO bevel/gloss/gradient/shadow */
+  #next-btn{ pointer-events:auto; cursor:pointer; border:none; padding:15px 64px;
+    background:#fd9606; color:#fff; font-size:25px; font-weight:900; letter-spacing:.3px;
+    border-radius:40px; -webkit-text-stroke:0;
+    transform:translateY(18px) scale(.9); opacity:0; }
+  #next-btn:active{ transform:scale(.96); opacity:.92; }
+
+  /* the completed photo shrinks into a white frame to make room for the ribbon + reward */
+  #board{ transition:transform .45s cubic-bezier(.34,1.35,.5,1); }
+  #board.complete{ transform:scale(.74); transform-origin:50% 27%; box-shadow:0 0 0 7px #fff, 0 14px 40px rgba(0,0,0,.42); border-radius:12px; }  /* anchored scale (no translate) so it doesn't appear to "move while zooming" */
+
+  /* confetti canvas overlays the whole stage on completion */
+  #confetti{ position:absolute; inset:0; z-index:12; display:none; pointer-events:none; }  /* ABOVE the result overlay (#overlay z8, #reward z9) so confetti rains OVER the congrats screen */
+
+  /* praise pop-text ("Great!" / "Amazing!" …) over the board on good swaps (ref feel) */
+  /* praise pop = a generated glossy WORD STICKER (image) over the board on good swaps */
+  #praise{ position:absolute; left:50%; top:38%; z-index:9; pointer-events:none;
+    width:54%; max-width:260px; height:auto;
+    transform:translate(-50%,-50%) scale(.4); opacity:0;
+    filter:drop-shadow(0 4px 10px rgba(0,0,0,.3)); }
+
+  /* CHEAT MODE — edge arrows (shown only when cheat on) + a brief on/off toast */
+  .cheat-arrow{ position:absolute; top:50%; transform:translateY(-50%); z-index:11; display:none;
+    width:44px; height:64px; border:none; border-radius:12px; cursor:pointer;
+    background:rgba(0,0,0,.42); color:#fff; font-size:34px; font-weight:900; line-height:1;
+    align-items:center; justify-content:center; box-shadow:0 3px 10px rgba(0,0,0,.3); }
+  .cheat-arrow.on{ display:flex; }
+  .cheat-arrow:active{ background:rgba(0,0,0,.6); }
+  #cheat-prev{ left:6px; }  #cheat-next{ right:6px; }
+  #cheat-toast{ position:absolute; left:50%; top:calc(70px + var(--safe-t)); transform:translateX(-50%);
+    z-index:12; background:#fd9606; color:#fff; font-weight:900; font-size:15px; padding:7px 16px;
+    border-radius:16px; opacity:0; transition:opacity .2s; pointer-events:none; white-space:nowrap;
+    box-shadow:0 4px 12px rgba(0,0,0,.3); }
+  #cheat-toast.show{ opacity:1; }
+
+  /* ── HELD-COIN HUD: dark translucent pill top-right (coin icon + total). Hidden during
+       normal play; shown on the result screen and while the hint shop popup is open. ── */
+  #coin-hud{ position:absolute; z-index:10; right:18px; top:calc(14px + var(--safe-t));
+    display:none; align-items:center; gap:7px;
+    padding:6px 16px 6px 9px; border-radius:22px; background:rgba(0,0,0,.34);
+    font-size:20px; font-weight:900; color:#fff; pointer-events:none;
+    text-shadow:0 2px 3px rgba(0,0,0,.4); }
+  #coin-hud img{ width:26px; height:26px; display:block;
+    filter:drop-shadow(0 1px 2px rgba(0,0,0,.45)); }
+
+  /* ── HINT SHOP popup: dim backdrop + white card (green header pill, red X, blue box +
+       green bulb, one green buy pill). Flat style, all CSS/SVG (no new images). ── */
+  #hint-shop{ position:fixed; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center;
+    background:rgba(0,0,0,.55); }
+  #hint-shop.open{ display:flex; }
+  .shop-card{ position:relative; width:78%; max-width:300px;
+    background:#fff; border-radius:22px; padding:40px 22px 24px;
+    box-shadow:0 18px 50px rgba(0,0,0,.4);
+    display:flex; flex-direction:column; align-items:center; gap:18px; }
+  /* green "Hint" header pill sits ON the card's top edge */
+  .shop-head{ position:absolute; top:-22px; left:50%; transform:translateX(-50%);
+    background:#37c26a; color:#fff; font-size:22px; font-weight:900;
+    padding:10px 40px; border-radius:24px;
+    box-shadow:0 6px 14px rgba(0,0,0,.22); white-space:nowrap; }
+  /* red circular X close at the card's top-right corner */
+  .shop-x{ position:absolute; top:-14px; right:-10px; width:40px; height:40px;
+    border:none; border-radius:50%; background:#ef4444; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 5px 12px rgba(0,0,0,.28); pointer-events:auto; }
+  .shop-x svg{ width:20px; height:20px; display:block; }
+  /* light-blue rounded box holding the big green bulb */
+  .shop-box{ width:100%; background:#e7f1fb; border-radius:16px;
+    padding:30px 0; display:flex; align-items:center; justify-content:center; }
+  .shop-box svg{ width:84px; height:84px; display:block; }
+  /* one green buy pill: coin icon + price + "x3" */
+  .shop-buy{ width:100%; border:none; cursor:pointer; pointer-events:auto;
+    background:#37c26a; color:#fff; border-radius:30px; padding:13px 0;
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    font-size:23px; font-weight:900;
+    box-shadow:0 6px 14px rgba(0,0,0,.18); }
+  .shop-buy img{ width:28px; height:28px; display:block; }
+  .shop-buy:active{ transform:scale(.97); opacity:.92; }
+  .shop-buy.shake{ animation:shopShake .4s; }
+  @keyframes shopShake{
+    0%,100%{ transform:translateX(0); background:#37c26a; }
+    15%{ transform:translateX(-8px); background:#e0533f; }
+    30%{ transform:translateX(8px); background:#e0533f; }
+    45%{ transform:translateX(-6px); background:#e0533f; }
+    60%{ transform:translateX(6px); background:#e0533f; }
+    75%{ transform:translateX(-3px); }
+  }
+  /* ── REELS LEAN MODE (user req 2026-06-30): in the GameReels build, HIDE the currency + item
+     meta-UI (coins, +coin reward, hint button + hint shop). HIDDEN, not deleted — reversible by
+     removing the `reels-lean` body class (see REELS_HIDE_META in the script). Level label + win
+     banner + Next stay. `!important` beats the inline display/visibility the JS sets. ── */
+  body.reels-lean #coin-hud,
+  body.reels-lean #reward,
+  body.reels-lean #hint-shop{ display:none !important; }
+  body.reels-lean #btn-hint{ visibility:hidden !important; pointer-events:none !important; }
+
+  /* ── STAGE-1 ONBOARDING TUTORIAL (first play only, gated by localStorage 'pp_tut_s1').
+     A non-blocking overlay (pointer-events:none everywhere) so the player drags FREELY:
+       #pp-tut-ring  — pulsing yellow highlight over the source-cell rect (JS sets its rect)
+       #pp-tut-hand  — pointing hand looping a press→drag→release from src-center → home-center
+                       (path driven by JS-set CSS vars --x0/--y0/--x1/--y1)
+       #pp-tut-text  — bottom-centered instruction text (and the centered goal/done text)
+     Works in BOTH builds; the reels-lean class above only hides the hint button, not this. ── */
+  #pp-tut{ position:absolute; inset:0; pointer-events:none; z-index:13; display:none; }
+  #pp-tut.on{ display:block; }
+  #pp-tut *{ pointer-events:none; }
+  #pp-tut-ring{ position:absolute; left:0; top:0; width:0; height:0; border-radius:14px;
+    box-shadow:0 0 0 3px rgba(255,214,64,.95), 0 0 18px 4px rgba(255,214,64,.55);
+    background:rgba(255,214,64,.10); opacity:0; transform-origin:center;
+    transition:opacity .25s; will-change:transform,opacity; }
+  #pp-tut-ring.show{ opacity:1; animation:tutRingPulse 1.25s ease-in-out infinite; }
+  @keyframes tutRingPulse{ 0%,100%{ transform:scale(1); }   50%{ transform:scale(1.06); } }
+  #pp-tut-hand{ position:absolute; left:0; top:0; width:54px; height:auto; opacity:0;
+    /* anchor the fingertip (near top of the sprite) to the drag point */
+    margin-left:-15px; margin-top:-6px;
+    filter:drop-shadow(0 4px 6px rgba(0,0,0,.45)); will-change:transform,opacity; }
+  #pp-tut-hand.show{ opacity:1; animation:tutHand 2.0s cubic-bezier(.45,.05,.55,.95) infinite; }
+  /* press at src → drag to home → release → fade-reset back to src */
+  @keyframes tutHand{
+    0%   { transform:translate(var(--x0),var(--y0)) scale(1);   opacity:0; }
+    8%   { transform:translate(var(--x0),var(--y0)) scale(1);   opacity:1; }
+    18%  { transform:translate(var(--x0),var(--y0)) scale(.82);  opacity:1; }   /* press */
+    65%  { transform:translate(var(--x1),var(--y1)) scale(.82);  opacity:1; }   /* drag */
+    78%  { transform:translate(var(--x1),var(--y1)) scale(1);    opacity:1; }   /* release */
+    90%  { transform:translate(var(--x1),var(--y1)) scale(1);    opacity:0; }
+    100% { transform:translate(var(--x0),var(--y0)) scale(1);    opacity:0; }
+  }
+  #pp-tut-text{ position:absolute; left:50%; bottom:7%; transform:translateX(-50%);
+    max-width:84%; text-align:center; color:#fff; font-weight:800; font-size:21px;
+    line-height:1.4; text-shadow:0 2px 8px rgba(0,0,0,.6), 0 0 2px rgba(0,0,0,.5);
+    opacity:0; transition:opacity .3s; }
+  #pp-tut-text.show{ opacity:1; }
+  /* centered variant for the goal ("complete the picture") + done message */
+  #pp-tut-text.center{ bottom:auto; top:50%; transform:translate(-50%,-50%);
+    font-size:24px; background:rgba(0,0,0,.32); padding:18px 22px; border-radius:18px;
+    backdrop-filter:blur(2px); }
+</style>
+<script>
+/* belt-and-suspenders for the long-press magnifier / text-copy callout (user req 2026-06-30):
+   the CSS (-webkit-touch-callout/user-select:none) handles iOS; this blocks the context menu
+   (Android long-press / desktop right-click) + image/selection drag. Does NOT touch pointer/
+   touch events, so the game's drag still works. */
+(function(){ var stop=function(e){ e.preventDefault(); };
+  document.addEventListener('contextmenu', stop, {passive:false});
+  document.addEventListener('selectstart', stop, {passive:false});
+  document.addEventListener('dragstart', stop, {passive:false}); })();
+</script>
+</head>
+<body>
+  <div id="bg"></div>
+  <div id="stage">
+    <!-- held-coin HUD: dark pill top-right (coin + total). Shown on result + hint shop. -->
+    <div id="coin-hud"><img src="assets/sprites/ui_coin.webp" alt="coin" /><span id="coin-total">0</span></div>
+    <div id="hud-top">
+      <div class="hud-spacer" aria-hidden="true"></div>   <!-- settings button removed (user req); spacer keeps the label centered -->
+      <div id="level-label">
+        <div class="cap">Level</div>
+        <div class="num" id="level-num">1</div>
+      </div>
+      <button class="hud-btn" id="btn-hint" aria-label="hint">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#16a06f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 18h6"/><path d="M10 21h4"/>
+          <path d="M12 3a6 6 0 0 0-4 10.5c.8.8 1.3 1.6 1.5 2.5h5c.2-.9.7-1.7 1.5-2.5A6 6 0 0 0 12 3z"/>
+        </svg>
+        <span class="badge" id="hint-badge">3</span>
+      </button>
+    </div>
+    <div id="board-wrap">
+      <canvas id="board"></canvas>
+      <canvas id="popfx"></canvas>
+      <canvas id="drag"></canvas>
+      <canvas id="confetti"></canvas>
+      <img id="praise" alt="" />
+    </div>
+    <!-- result overlay covers the WHOLE stage so the banner sits near the top (HUD is hidden on win) -->
+    <div id="overlay">
+      <div id="ribbon">Congratulations!</div>
+      <canvas id="montage"></canvas>
+      <div id="reward"><img class="coin" src="assets/sprites/ui_coin.webp" alt="coin" />+50</div>
+      <div id="result-bottom">
+        <button id="next-btn">Next</button>
+      </div>
+    </div>
+    <!-- CHEAT MODE (dev, play-link only): triple-click the Stage label to toggle; ◀▶ jump stages -->
+    <button id="cheat-prev" class="cheat-arrow" aria-label="prev stage">‹</button>
+    <button id="cheat-next" class="cheat-arrow" aria-label="next stage">›</button>
+    <div id="cheat-toast"></div>
+    <!-- STAGE-1 ONBOARDING TUTORIAL overlay (non-blocking; shown via .on, see #pp-tut CSS) -->
+    <div id="pp-tut">
+      <div id="pp-tut-ring"></div>
+      <img id="pp-tut-hand" src="assets/sprites/ui_hand.webp" alt="" />
+      <div id="pp-tut-text"></div>
+    </div>
+  </div>
+
+  <!-- HINT SHOP popup — fixed to the VIEWPORT (not the transform-centered #stage) so the dim
+       covers full screen on any aspect (L33). Buy 3 hints for 900 coins. No ad button. -->
+  <div id="hint-shop">
+    <div class="shop-card">
+      <div class="shop-head">Hint</div>
+      <button class="shop-x" id="shop-close" aria-label="close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round">
+          <path d="M6 6l12 12M18 6L6 18"/>
+        </svg>
+      </button>
+      <div class="shop-box">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#37c26a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 18h6"/><path d="M10 21h4"/>
+          <path d="M12 3a6 6 0 0 0-4 10.5c.8.8 1.3 1.6 1.5 2.5h5c.2-.9.7-1.7 1.5-2.5A6 6 0 0 0 12 3z"/>
+        </svg>
+      </div>
+      <button class="shop-buy" id="shop-buy">
+        <img src="assets/sprites/ui_coin.webp" alt="coin" /><span>900</span>&nbsp;x3
+      </button>
+    </div>
+  </div>
+
+<script>window.__GAMEREELS=true;window.structuredClone=window.structuredClone||function(o){return JSON.parse(JSON.stringify(o));};</script>
+<script>(() => {
+  // engine/hostbridge.js
+  var TOTAL_STAGES = 100;
+  var GR = (function() {
+    let ACTIVE = false;
+    try {
+      ACTIVE = /[?&]gamereels\b/.test(location.search) || !!window.__GAMEREELS;
+    } catch (e) {
+      ACTIVE = false;
+    }
+    const noop = function() {
+    };
+    if (!ACTIVE) {
+      return { active: false, emit: noop, gameStart: noop, gameEnd: noop, vibrate: noop, setPaused: noop, isPaused: function() {
+        return false;
+      }, gameState: noop, provideState: noop, onState: noop };
+    }
+    let _paused = false, _startSent = false;
+    function _emit(event, data) {
+      if (data === void 0) data = null;
+      const msg = { event, data };
+      try {
+        if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) window.flutter_inappwebview.callHandler("flutterChannel", msg);
+      } catch (e) {
+      }
+      try {
+        if (window.GameReels && window.GameReels.post) window.GameReels.post(event, data);
+      } catch (e) {
+      }
+      try {
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.gamereels) window.webkit.messageHandlers.gamereels.postMessage(msg);
+      } catch (e) {
+      }
+      try {
+        if (window.parent && window.parent !== window) window.parent.postMessage(msg, "*");
+      } catch (e) {
+      }
+      try {
+        window.postMessage(msg, "*");
+      } catch (e) {
+      }
+    }
+    function emit(event, data) {
+      try {
+        _emit(event, data);
+      } catch (e) {
+      }
+    }
+    function _emitStart() {
+      emit("GameStart", null);
+    }
+    function gameStart() {
+      if (_startSent) return;
+      _startSent = true;
+      _emitStart();
+      [300, 800, 1600, 3e3, 5e3].forEach(function(ms) {
+        try {
+          setTimeout(_emitStart, ms);
+        } catch (e) {
+        }
+      });
+    }
+    function gameEnd(success, level) {
+      emit("GameEnd", { success: !!success, progressIndex: level | 0, currentIndex: level | 0 });
+    }
+    const VMAP = { selection: "SoftVibrate", light: "LightVibrate", medium: "MediumVibrate", heavy: "MediumVibrate" };
+    function vibrate(level) {
+      emit(VMAP[level] || "LightVibrate");
+    }
+    let _stateProvider = null, _restoreCb = null;
+    function gameState(data) {
+      emit("GameState", data == null ? {} : data);
+    }
+    function provideState(fn) {
+      _stateProvider = typeof fn === "function" ? fn : null;
+    }
+    function onState(fn) {
+      _restoreCb = typeof fn === "function" ? fn : null;
+    }
+    function setPaused(p) {
+      p = !!p;
+      if (p === _paused) return;
+      _paused = p;
+      let blk = document.getElementById("gr-pause-block");
+      if (p) {
+        if (!blk) {
+          blk = document.createElement("div");
+          blk.id = "gr-pause-block";
+          blk.style.cssText = "position:fixed;inset:0;z-index:99999;background:transparent;touch-action:none";
+          (document.body || document.documentElement).appendChild(blk);
+        }
+        blk.style.display = "block";
+        try {
+          if (window.__audio && window.__audio.pause) window.__audio.pause();
+        } catch (e) {
+        }
+      } else {
+        if (blk) blk.style.display = "none";
+        try {
+          if (window.__audio && window.__audio.resume) window.__audio.resume();
+        } catch (e) {
+        }
+      }
+    }
+    let _hostSeen = false;
+    function _recv(raw) {
+      if (!_hostSeen) {
+        _hostSeen = true;
+        if (_startSent) _emitStart();
+      }
+      let m = raw;
+      if (typeof raw === "string") {
+        try {
+          m = JSON.parse(raw);
+        } catch (e) {
+          m = { event: raw };
+        }
+      }
+      if (!m || !m.event) return;
+      if (m.event === "GamePause") setPaused(true);
+      else if (m.event === "GameResume") setPaused(false);
+      else if (m.event === "GameState") {
+        if (_restoreCb) {
+          try {
+            _restoreCb(m.data || {});
+          } catch (e) {
+          }
+        }
+      } else if (m.event === "RequestState") {
+        if (_stateProvider) {
+          try {
+            emit("GameState", _stateProvider() || {});
+          } catch (e) {
+          }
+        }
+      }
+    }
+    try {
+      window.OnMessageFromFlutter = function(d) {
+        _recv(d);
+      };
+    } catch (e) {
+    }
+    try {
+      window.addEventListener("message", function(ev) {
+        const d = ev && ev.data;
+        if (d && (d.event === "GamePause" || d.event === "GameResume")) _recv(d);
+      });
+    } catch (e) {
+    }
+    try {
+      window.addEventListener("GamePause", function() {
+        setPaused(true);
+      });
+      window.addEventListener("GameResume", function() {
+        setPaused(false);
+      });
+    } catch (e) {
+    }
+    return { active: true, emit, gameStart, gameEnd, vibrate, setPaused, isPaused: function() {
+      return _paused;
+    }, gameState, provideState, onState };
+  })();
+  try {
+    window.__GR = GR;
+  } catch (e) {
+  }
+  try {
+    if (GR.active && document.body) document.body.classList.add("gamereels");
+  } catch (e) {
+  }
+  var HAPTIC = {
+    enabled: true,
+    MS: { selection: 8, light: 16, medium: 28, heavy: 48 },
+    // web fallback vibration length (ms)
+    GAP: { selection: 50, light: 60 }
+    // throttle (ms): avoid motor overload / rapid-fire
+  };
+  var _hapticLast = {};
+  function haptic(level) {
+    if (!HAPTIC.enabled) return;
+    try {
+      if (GR && GR.active) GR.vibrate(level);
+    } catch (e) {
+    }
+    const gap = HAPTIC.GAP[level] || 0;
+    if (gap) {
+      const t = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+      if (t - (_hapticLast[level] || 0) < gap) return;
+      _hapticLast[level] = t;
+    }
+    try {
+      if (window.Haptics && window.Haptics.impact) {
+        window.Haptics.impact(level);
+        return;
+      }
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.haptic) {
+        window.webkit.messageHandlers.haptic.postMessage(level);
+        return;
+      }
+      if (window.AndroidHaptic && window.AndroidHaptic.impact) {
+        window.AndroidHaptic.impact(level);
+        return;
+      }
+    } catch (e) {
+    }
+    try {
+      if (navigator.vibrate) navigator.vibrate(HAPTIC.MS[level] || 12);
+    } catch (e) {
+    }
+  }
+  var RT = (function() {
+    const TOTAL = TOTAL_STAGES;
+    let q = null;
+    try {
+      q = new URLSearchParams(location.search);
+    } catch (e) {
+      q = null;
+    }
+    const get = (k) => {
+      try {
+        return q ? q.get(k) : null;
+      } catch (e) {
+        return null;
+      }
+    };
+    const intOf = (v, dflt) => {
+      const n = parseInt(v, 10);
+      return Number.isFinite(n) ? n : dflt;
+    };
+    const clamp = (n) => Math.max(1, Math.min(TOTAL, n | 0));
+    let from = clamp(intOf(get("from") != null ? get("from") : get("level"), 1));
+    let to = clamp(intOf(get("to"), TOTAL));
+    if (from > to) to = from;
+    const loopRaw = intOf(get("loop"), 0);
+    const loop = loopRaw > 0 ? loopRaw : 0;
+    let dev = false;
+    try {
+      const dv = get("dev");
+      dev = dv != null && dv !== "0" && dv !== "false" || !!window.__GAMEREELS_DEV;
+    } catch (e) {
+      dev = false;
+    }
+    const isLevelLimited = from > 1 || to < TOTAL;
+    function shouldEmitGameEnd(level) {
+      const lv = level | 0;
+      if (to < TOTAL) return lv === to;
+      if (loop > 0) return lv > 0 && lv % loop === 0;
+      return lv > 0 && lv % 30 === 0;
+    }
+    return {
+      TOTAL,
+      from,
+      to,
+      loop,
+      dev,
+      isLevelLimited,
+      shouldEmitGameEnd
+    };
+  })();
+
+  // .build_multi_entry.tmp.mjs
+  var MAX_LEVEL = 100;
+  var GRAV_POOL_SIZE = 60;
+  var STAGE = (function() {
+    try {
+      const q = new URLSearchParams(location.search);
+      const s = parseInt(q.get("stage"), 10);
+      if (Number.isFinite(s) && s >= 1) return Math.min(MAX_LEVEL, s);
+    } catch (e) {
+    }
+    return 1;
+  })();
+  var GRAVITY_LEVELS = [5, 9, 12, 18, 22, 24, 29, 32, 38, 42, 45, 50, 52, 58, 62, 65, 70, 74, 76, 82, 85, 90, 94, 97];
+  var GRID_TIERS = [[3, 3], [3, 4], [4, 4], [4, 5], [5, 5], [5, 6], [6, 6], [6, 7]];
+  function baseTier(L) {
+    if (L <= 3) return 0;
+    if (L <= 9) return 1;
+    if (L <= 18) return 2;
+    if (L <= 30) return 3;
+    if (L <= 45) return 4;
+    if (L <= 62) return 5;
+    if (L <= 82) return 6;
+    return 7;
+  }
+  function buildLevels() {
+    const gset = new Set(GRAVITY_LEVELS), arr = [null];
+    let si = 0;
+    let gc = 0;
+    for (let L = 1; L <= MAX_LEVEL; L++) {
+      if (gset.has(L)) {
+        const p = (L - 1) / (MAX_LEVEL - 1);
+        const deckPics = Math.max(2, Math.min(10, Math.round(2 + p * 8)));
+        arr.push({ mode: "gravity", deckPics, poolStart: gc });
+        gc = (gc + 4 + deckPics) % GRAV_POOL_SIZE;
+      } else {
+        let t = baseTier(L);
+        if (L > 3) {
+          const pos = (L - 4) % 6;
+          if (pos === 5) t += 1;
+          else if (pos === 0) t -= 1;
+        }
+        t = Math.max(0, Math.min(GRID_TIERS.length - 1, t));
+        arr.push({ mode: "single", cols: GRID_TIERS[t][0], rows: GRID_TIERS[t][1], photoIdx: si++ });
+      }
+    }
+    return arr;
+  }
+  var LEVELS = buildLevels();
+  function levelEntry(L) {
+    return LEVELS[Math.max(1, Math.min(MAX_LEVEL, L | 0))];
+  }
+  var MODE = (function() {
+    try {
+      if (typeof window !== "undefined" && window.__MODE === "gravity") return "gravity";
+    } catch (e) {
+    }
+    try {
+      if (new URLSearchParams(location.search).get("mode") === "gravity") return "gravity";
+    } catch (e) {
+    }
+    return levelEntry(STAGE).mode;
+  })();
+  var IS_GRAVITY = MODE === "gravity";
+  try {
+    if (IS_GRAVITY && document.body) document.body.classList.add("gravmode");
+  } catch (e) {
+  }
+  var CFG = {
+    GRID: { cols: 4, rows: 4 },
+    // initial grid (overridden per-level by levelDef)
+    // REFERENCE-MATCH (measured from user's hi-res ref, Level 4): scrambled tiles are
+    // rounded cards with a SMALL gap (teal gridline shows ~2% of tile) + a subtle light
+    // border. On completion gap+radius converge to 0 → seamless photo. Board is PORTRAIT,
+    // picture fills it (board aspect === image aspect → no slice distortion).
+    GAP_FRAC: 0.02,
+    // inter-tile gap ÷ tile size (ref ≈ very slight gridline)
+    RADIUS_FRAC: 0.055,
+    // tile corner radius ÷ tile size (ref: rounded tiles)
+    BORDER_A: 0.28,
+    // subtle light rim alpha (the "테두리" border)
+    BOARD_ASPECT: 2 / 3,
+    // portrait board W/H (matches ref ~0.6 + 2:3 photo gen)
+    BOARD_PAD: 0,
+    // inner board padding
+    // deal-in: tiles fly in face-down, staggered, ease-out, small land-bounce.
+    // MEASURED from ref MOV @60fps: whole 16-tile deal lands in ~0.65s, then a brief
+    // hold (~0.2s) before the reveal flip sweep.
+    DEAL_STAGGER: 28,
+    // ms between consecutive tiles (15*28+230 ≈ 650ms total)
+    DEAL_DUR: 230,
+    // ms per-tile fly-in (ease-out)
+    DEAL_BOUNCE: 0.08,
+    // land overshoot fraction (scale dips/pops on land)
+    DEAL_FROM_Y: 0.55,
+    // start offset as fraction of board height below the board (shorter, snappier)
+    DEAL_FROM_SPREADX: 0.03,
+    // tiny horizontal fan on entry (frac of board width)
+    // reveal: face-down → scrambled picture as a 3D vertical-axis FLIP (ref shows each
+    // card narrow to a thin strip then the image widens out — NOT a cross-fade), staggered sweep.
+    REVEAL_DELAY: 200,
+    // ms hold on the full face-down grid before the flip starts
+    REVEAL_DUR: 240,
+    // ms per-tile flip (scaleX 1→0 back, 0→1 face)
+    REVEAL_STAGGER: 34,
+    // ms between tiles (left→right sweep)
+    // pick-up: grabbed tile lifts
+    PICK_SCALE: 1.06,
+    PICK_DUR: 110,
+    // block-swap: every piece tweens to its new cell, then settle-bounce
+    SWAP_DUR: 200,
+    // ms ease-in-out tween (180–220)
+    BOUNCE_DUR: 140,
+    // ms settle bounce
+    BOUNCE_OVER: 0.06,
+    // overshoot fraction (centered scale pop). Halved from .13 → the settle no
+    // longer visibly "rises" on stage-1's large 3×3 tiles (user: "살짝 위로 올라갔다가").
+    RETURN_DUR: 160,
+    // ms snap-back when dropped on empty/itself
+    MERGE_DUR: 220,
+    // ms border-merge: a newly-bonded seam closes its gap +
+    // fades its border out (per-edge bond progress 0→1, ease-out)
+    // completion: gridline gaps animate to 0 (seamless), then confetti + banner + Next
+    HINTS: 3,
+    // hint charges per level (tap bulb → auto-place one piece)
+    CONVERGE_DUR: 300,
+    // ms gaps → 0
+    BANNER_DUR: 360,
+    // ms banner pop-in
+    NEXT_DELAY: 220,
+    // ms after banner before Next button appears
+    CONFETTI_N: 90,
+    // bounded confetti particle count (center pop; rain adds ~2.2× more)
+    CONFETTI_MS: 3e3,
+    // confetti lifetime (long enough for the sky-rain to fall through)
+    // praise pop-text on swaps that place tile(s) correctly (ref shows Great!/Amazing!/…)
+    PRAISE_IN: 200,
+    // ms pop-in (scale .4→1.12→1, ease-out-back)
+    PRAISE_HOLD: 360,
+    // ms hold at full
+    PRAISE_OUT: 260,
+    // ms fade + rise out
+    PUZZLE_RES: 720
+    // offscreen procedural-picture resolution (square source)
+  };
+  var GRAV = {
+    COLS: 4,
+    // board width (fixed)
+    TILE_RATIO: 1.5,
+    // tile HEIGHT/WIDTH — PORTRAIT 2:3 (matches the 2:3 photos → no distortion)
+    PLAY_ROWS: 4,
+    // visible play area rows (4 = 4 pictures; keeps the board wide enough with portrait tiles)
+    DECK_ROWS: 1.5,
+    // deck region height above the play area (compact card PILE) — small so the board fills the screen
+    PLAY_PICS: 4,
+    // pictures whose tiles start IN the play area (= (COLS/2)*(PLAY_ROWS/2))
+    DECK_PICS: 4,
+    // extra pictures queued face-down in the deck (total 8 ≤ 9 photos → all distinct)
+    DECK_DIM: 1,
+    // deck cards are SOLID (opaque) like the reference — no transparency
+    CLEAR_POP: 360,
+    // ms picture-complete pop+fade before its cells empty
+    GRAVITY_DUR: 260,
+    // ms a column's fall animation (ease-in, like dropping)
+    FEED_DUR: 300,
+    // ms a deck card's descent into the play area
+    FLIP_DUR: 260
+    // ms a fed card's 3D flip reveal as it enters play
+  };
+  var PRAISE = [
+    { word: "Nice!", img: "assets/sprites/ui_word_nice.webp" },
+    { word: "Great!", img: "assets/sprites/ui_word_great.webp" },
+    { word: "Cool!", img: "assets/sprites/ui_word_cool.webp" },
+    { word: "Awesome!", img: "assets/sprites/ui_word_awesome.webp" },
+    { word: "Perfect!", img: "assets/sprites/ui_word_perfect.webp" },
+    { word: "Amazing!", img: "assets/sprites/ui_word_amazing.webp" },
+    { word: "Fantastic!", img: "assets/sprites/ui_word_fantastic.webp" }
+  ];
+  PRAISE.forEach((p) => {
+    try {
+      const im = new Image();
+      im.src = p.img;
+    } catch (e) {
+    }
+  });
+  var easeOut = (t) => 1 - Math.pow(1 - t, 3);
+  var easeInOut = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  var easeOutBack = (t) => {
+    const c1 = 1.70158, c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  };
+  var clamp01 = (t) => t < 0 ? 0 : t > 1 ? 1 : t;
+  var lerp = (a, b, t) => a + (b - a) * t;
+  var now = () => performance.now();
+  var SFX_SRCS = typeof window !== "undefined" && window.__SFX ? window.__SFX : {
+    pick: "assets/audio/pick.mp3",
+    snap: "assets/audio/snap.mp3",
+    place: "assets/audio/place.mp3",
+    complete: "assets/audio/complete.mp3"
+  };
+  var SFX = /* @__PURE__ */ (function() {
+    let ctx = null, master = null;
+    const buf = {};
+    function init() {
+      if (ctx) return;
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        ctx = new AC();
+        master = ctx.createGain();
+        master.gain.value = 0.7;
+        master.connect(ctx.destination);
+        const wake = () => {
+          try {
+            if (ctx && ctx.state !== "running") ctx.resume();
+          } catch (e) {
+          }
+        };
+        ["pointerdown", "touchstart", "touchend", "click", "keydown"].forEach((ev) => window.addEventListener(ev, wake, { passive: true, capture: true }));
+        document.addEventListener("visibilitychange", () => {
+          if (!document.hidden) wake();
+        });
+        window.addEventListener("focus", wake);
+        window.addEventListener("pageshow", wake);
+        ctx.onstatechange = wake;
+        try {
+          const ka = ctx.createOscillator(), kg = ctx.createGain();
+          kg.gain.value = 0;
+          ka.connect(kg);
+          kg.connect(ctx.destination);
+          ka.start();
+        } catch (e) {
+        }
+        for (const name in SFX_SRCS) {
+          (function(n) {
+            fetch(SFX_SRCS[n]).then((r) => r.arrayBuffer()).then((a) => new Promise((res, rej) => ctx.decodeAudioData(a, res, rej))).then((b) => {
+              buf[n] = b;
+            }).catch(() => {
+            });
+          })(name);
+        }
+      } catch (e) {
+      }
+    }
+    function resume() {
+      try {
+        if (ctx && ctx.state === "suspended") ctx.resume();
+      } catch (e) {
+      }
+    }
+    function play(name, vol) {
+      try {
+        if (!ctx) return;
+        resume();
+        const b = buf[name];
+        if (!b) return;
+        const s = ctx.createBufferSource();
+        s.buffer = b;
+        const g = ctx.createGain();
+        g.gain.value = vol == null ? 1 : vol;
+        s.connect(g);
+        g.connect(master);
+        s.start(0);
+      } catch (e) {
+      }
+    }
+    return {
+      init,
+      resume,
+      play,
+      loaded: () => Object.keys(buf).length,
+      names: () => Object.keys(SFX_SRCS),
+      _ctx: () => ctx,
+      _master: () => master
+    };
+  })();
+  try {
+    window.__sfx = SFX;
+  } catch (e) {
+  }
+  function rng(seed) {
+    let a = seed >>> 0;
+    return function() {
+      a |= 0;
+      a = a + 1831565813 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var psrc = (base) => "assets/puzzles/" + base + ".webp";
+  var PUZZLE_SRCS = typeof window !== "undefined" && window.__PUZZLE_IMAGES && window.__PUZZLE_IMAGES.length ? window.__PUZZLE_IMAGES : ["real1", "real2", "real3", "real4", "real5", "real6", "real7", "real8", "real9"].map(psrc);
+  var puzzleImages = PUZZLE_SRCS.map(() => null);
+  var SINGLE_SRCS = Array.from({ length: 76 }, (_, i) => psrc("sg" + String(i + 1).padStart(3, "0")));
+  var singleCache = SINGLE_SRCS.map(() => null);
+  var GRAV_POOL = Array.from({ length: GRAV_POOL_SIZE }, (_, i) => psrc("gv" + String(i + 1).padStart(2, "0")));
+  var gravPoolImages = GRAV_POOL.map(() => null);
+  function imageIndexForLevel(L) {
+    const n = PUZZLE_SRCS.length;
+    return (((L | 0) - 1) % n + n) % n;
+  }
+  function singlePhotoIdx(L) {
+    const e = LEVELS[Math.max(1, Math.min(MAX_LEVEL, L | 0))];
+    const i = e && e.photoIdx != null ? e.photoIdx : L - 1;
+    return (i % SINGLE_SRCS.length + SINGLE_SRCS.length) % SINGLE_SRCS.length;
+  }
+  function preloadPuzzleImages() {
+    if (STAGE_FLOW) return;
+    PUZZLE_SRCS.forEach((src, i) => {
+      const im = new Image();
+      im.decoding = "async";
+      im.onload = () => {
+        puzzleImages[i] = im;
+        if (IS_GRAVITY) {
+          let touched = false;
+          for (let pid = 0; pid < State.picSrcIdx.length; pid++) {
+            if (State.picSrcIdx[pid] === i && !State.picImg[pid]) {
+              State.picImg[pid] = im;
+              touched = true;
+            }
+          }
+          if (touched) {
+            invalidateStaticCache();
+            drawBoard();
+          }
+          return;
+        }
+        if (imageIndexForLevel(State.level) === i && State.puzzleImg && State.puzzleImg.__procedural) {
+          State.puzzleImg = im;
+          invalidateStaticCache();
+          drawBoard();
+        }
+      };
+      im.onerror = () => {
+        puzzleImages[i] = null;
+      };
+      im.src = src;
+    });
+  }
+  function buildPuzzleImage(variant) {
+    const S = CFG.PUZZLE_RES;
+    const W = S, H = Math.round(S / CFG.BOARD_ASPECT);
+    const c = document.createElement("canvas");
+    c.width = W;
+    c.height = H;
+    const g = c.getContext("2d");
+    g.scale(W / S, H / S);
+    const PAL = [
+      { skyTop: "#ffd59e", skyBot: "#ff9aa8", sun: "#fff3c4", hills: ["#7b4ea0", "#9a5fae", "#c06fae", "#e58fa0"] },
+      { skyTop: "#a8e6ff", skyBot: "#dff6e0", sun: "#fffae0", hills: ["#2e8b6f", "#3fae84", "#7cc88f", "#bfe3a0"] },
+      { skyTop: "#fce3a0", skyBot: "#a7d8ff", sun: "#fff7d0", hills: ["#3a6ea5", "#4f8fc0", "#7bb6d6", "#a9d8e6"] },
+      { skyTop: "#c4b5fd", skyBot: "#fbcfe8", sun: "#fff0f8", hills: ["#6d28d9", "#8b5cf6", "#c084fc", "#f0abfc"] }
+    ];
+    const p = PAL[((variant | 0) % PAL.length + PAL.length) % PAL.length];
+    const sky = g.createLinearGradient(0, 0, 0, S);
+    sky.addColorStop(0, p.skyTop);
+    sky.addColorStop(1, p.skyBot);
+    g.fillStyle = sky;
+    g.fillRect(0, 0, S, S);
+    const sx = S * 0.7, sy = S * 0.26, sr = S * 0.12;
+    const glow = g.createRadialGradient(sx, sy, sr * 0.2, sx, sy, sr * 2.4);
+    glow.addColorStop(0, p.sun);
+    glow.addColorStop(0.35, p.sun);
+    glow.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = glow;
+    g.beginPath();
+    g.arc(sx, sy, sr * 2.4, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = p.sun;
+    g.beginPath();
+    g.arc(sx, sy, sr, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = "rgba(255,255,255,0.85)";
+    drawCloud(g, S * 0.22, S * 0.18, S * 0.1);
+    drawCloud(g, S * 0.48, S * 0.36, S * 0.07);
+    const layers = p.hills;
+    for (let i = 0; i < layers.length; i++) {
+      const baseY = S * (0.5 + i * 0.13);
+      const amp = S * (0.05 + i * 0.012);
+      const phase = i * 1.7 + variant * 0.6;
+      const freq = 1.4 + i * 0.5;
+      g.fillStyle = layers[i];
+      g.beginPath();
+      g.moveTo(0, S);
+      g.lineTo(0, baseY + Math.sin(phase) * amp);
+      for (let x = 0; x <= S; x += 8) {
+        const y = baseY + Math.sin(x / S * Math.PI * freq + phase) * amp;
+        g.lineTo(x, y);
+      }
+      g.lineTo(S, S);
+      g.closePath();
+      g.fill();
+    }
+    const tx = S * 0.3, tBase = S * 0.86;
+    g.strokeStyle = "rgba(40,20,30,0.55)";
+    g.lineWidth = S * 0.012;
+    g.lineCap = "round";
+    g.beginPath();
+    g.moveTo(tx, tBase);
+    g.lineTo(tx, tBase - S * 0.14);
+    g.stroke();
+    g.fillStyle = "rgba(30,70,40,0.85)";
+    g.beginPath();
+    g.arc(tx, tBase - S * 0.18, S * 0.055, 0, Math.PI * 2);
+    g.fill();
+    g.beginPath();
+    g.arc(tx - S * 0.04, tBase - S * 0.13, S * 0.04, 0, Math.PI * 2);
+    g.fill();
+    g.beginPath();
+    g.arc(tx + S * 0.04, tBase - S * 0.13, S * 0.04, 0, Math.PI * 2);
+    g.fill();
+    c.__procedural = true;
+    return c;
+  }
+  function drawCloud(g, x, y, r) {
+    g.beginPath();
+    g.arc(x, y, r, 0, Math.PI * 2);
+    g.arc(x + r * 0.9, y + r * 0.15, r * 0.75, 0, Math.PI * 2);
+    g.arc(x - r * 0.9, y + r * 0.2, r * 0.7, 0, Math.PI * 2);
+    g.arc(x + r * 0.2, y + r * 0.45, r * 0.85, 0, Math.PI * 2);
+    g.fill();
+  }
+  function buildCardBack(w, h) {
+    const c = document.createElement("canvas");
+    c.width = Math.max(2, Math.round(w));
+    c.height = Math.max(2, Math.round(h));
+    const g = c.getContext("2d");
+    const grad = g.createLinearGradient(0, 0, 0, c.height);
+    grad.addColorStop(0, "#3f86f0");
+    grad.addColorStop(1, "#2f6fe0");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, c.width, c.height);
+    g.strokeStyle = "rgba(255,255,255,0.12)";
+    g.lineWidth = Math.max(1, c.width * 0.01);
+    const d = Math.max(18, Math.round(c.width * 0.34));
+    for (let i = -c.height; i < c.width + c.height; i += d) {
+      g.beginPath();
+      g.moveTo(i, 0);
+      g.lineTo(i + c.height, c.height);
+      g.stroke();
+      g.beginPath();
+      g.moveTo(i, 0);
+      g.lineTo(i - c.height, c.height);
+      g.stroke();
+    }
+    g.fillStyle = "rgba(255,255,255,0.10)";
+    for (let y = 0; y <= c.height; y += d) for (let x = 0; x <= c.width; x += d) {
+      g.beginPath();
+      g.arc(x, y, Math.max(1.5, c.width * 0.018), 0, Math.PI * 2);
+      g.fill();
+    }
+    const cx = c.width / 2, cy = c.height / 2, er = Math.min(c.width, c.height) * 0.2;
+    g.save();
+    g.translate(cx, cy);
+    g.strokeStyle = "rgba(255,255,255,0.22)";
+    g.lineWidth = Math.max(2, er * 0.1);
+    g.beginPath();
+    g.arc(0, 0, er * 1.25, 0, Math.PI * 2);
+    g.stroke();
+    g.fillStyle = "rgba(255,255,255,0.18)";
+    for (let k = 0; k < 6; k++) {
+      g.save();
+      g.rotate(k * Math.PI / 3);
+      g.beginPath();
+      g.ellipse(0, -er * 0.7, er * 0.28, er * 0.55, 0, 0, Math.PI * 2);
+      g.fill();
+      g.restore();
+    }
+    g.fillStyle = "rgba(255,255,255,0.30)";
+    g.beginPath();
+    g.arc(0, 0, er * 0.3, 0, Math.PI * 2);
+    g.fill();
+    g.restore();
+    return c;
+  }
+  var boardCanvas = document.getElementById("board");
+  var bctx = boardCanvas.getContext("2d");
+  var dragCanvas = document.getElementById("drag");
+  var dctx = dragCanvas.getContext("2d");
+  var popfxCanvas = document.getElementById("popfx");
+  var pfx = popfxCanvas.getContext("2d");
+  var overlay = document.getElementById("overlay");
+  var banner = document.getElementById("ribbon");
+  var rewardEl = document.getElementById("reward");
+  var nextBtn = document.getElementById("next-btn");
+  var montageCanvas = document.getElementById("montage");
+  var mctx = montageCanvas.getContext("2d");
+  var levelNumEl = document.getElementById("level-num");
+  var levelCapEl = document.querySelector("#level-label .cap");
+  var confettiCanvas = document.getElementById("confetti");
+  var STAGE_FLOW = !GR.active;
+  var REELS_HIDE_META = GR.active;
+  try {
+    if (REELS_HIDE_META && document.body) document.body.classList.add("reels-lean");
+  } catch (e) {
+  }
+  function applyStageLabel() {
+    if (!STAGE_FLOW) return;
+    if (levelCapEl) levelCapEl.textContent = "Stage";
+    levelNumEl.textContent = String(STAGE);
+  }
+  var hintBadgeEl = document.getElementById("hint-badge");
+  var btnHintEl = document.getElementById("btn-hint");
+  var coinHudEl = document.getElementById("coin-hud");
+  var coinTotalEl = document.getElementById("coin-total");
+  var hintShopEl = document.getElementById("hint-shop");
+  var shopBuyEl = document.getElementById("shop-buy");
+  var shopCloseEl = document.getElementById("shop-close");
+  var WALLET_KEYS = { coins: "pp_coins", hints: "pp_hints" };
+  var WALLET_DEFAULTS = { coins: 0, hints: 5 };
+  var __memStore = {};
+  function lsGet(k) {
+    try {
+      const v = localStorage.getItem(k);
+      if (v != null) return v;
+    } catch (e) {
+    }
+    return k in __memStore ? __memStore[k] : null;
+  }
+  function lsSet(k, v) {
+    __memStore[k] = String(v);
+    try {
+      localStorage.setItem(k, String(v));
+    } catch (e) {
+    }
+  }
+  var Wallet = (function() {
+    const readInt = (k, d) => {
+      const v = parseInt(lsGet(k), 10);
+      return Number.isFinite(v) ? v : d;
+    };
+    return {
+      coins: readInt(WALLET_KEYS.coins, WALLET_DEFAULTS.coins),
+      hints: readInt(WALLET_KEYS.hints, WALLET_DEFAULTS.hints)
+    };
+  })();
+  function saveWallet() {
+    lsSet(WALLET_KEYS.coins, Wallet.coins);
+    lsSet(WALLET_KEYS.hints, Wallet.hints);
+    if (GR.active) {
+      try {
+        GR.gameState(grSnapshot());
+      } catch (e) {
+      }
+    }
+  }
+  function coinsForLevel() {
+    if (IS_GRAVITY) return Math.round((50 + (State.totalPics || 0) * 8) / 5) * 5;
+    return Math.round((20 + State.cols * State.rows) / 5) * 5;
+  }
+  function updateCoinHud() {
+    if (coinTotalEl) coinTotalEl.textContent = String(Wallet.coins);
+  }
+  function showCoinHud(on) {
+    if (coinHudEl) coinHudEl.style.display = on ? "flex" : "none";
+  }
+  var DPR = Math.min(2.5, window.devicePixelRatio || 1);
+  var State = {
+    cols: CFG.GRID.cols,
+    rows: CFG.GRID.rows,
+    N: CFG.GRID.cols * CFG.GRID.rows,
+    level: 1,
+    // 1-based level
+    hints: 3,
+    // hint charges this level
+    seed: 1,
+    puzzleImg: null,
+    // offscreen procedural picture
+    cardBack: null,
+    // offscreen face-down card
+    boardW: 0,
+    boardH: 0,
+    // board pixel size (PORTRAIT, @DPR)
+    tileW: 0,
+    tileH: 0,
+    // tile content size (px @DPR) — tiles are FLUSH (gap=0)
+    gap: 0,
+    radius: 0,
+    // current gap (always 0) / radius (@DPR) — radius shrinks to 0 on complete
+    cell: [],
+    // cell[ci] = tile index occupying cell ci
+    tiles: [],
+    // tiles[ti] = { home, faceUp, reveal }
+    phase: "boot",
+    // boot | deal | reveal | play | swapping | complete
+    anims: [],
+    // active per-tile anims (deal/reveal/swap/return/bounce)
+    dragging: null,
+    // { group:[cells], originCell, ... } while a group is held
+    gridConverge: 0,
+    // 0..1 — gaps shrink as this → 1 (completion)
+    pad: 0,
+    // GRAVITY: canvas headroom (px @DPR) AROUND the grid so a clear/merge
+    // pop can grow IN PLACE and spill past the grid without being clipped
+    // by the canvas edge. cellXY/deckCellXY offset the grid by this. 0 = single mode.
+    fx: null,
+    // active fuse-emphasis outline glow {cells,glow,scale,pivot} or null
+    // FUSE: per-cell-edge bond progress (0=loose seam, 1=fully merged/seamless).
+    // bondH[ci] = progress of the seam to the RIGHT of cell ci (with cell ci+1).
+    // bondV[ci] = progress of the seam BELOW cell ci (with cell ci+cols).
+    bondH: [],
+    bondV: [],
+    // ── GRAVITY MODE state (unused in single mode) ──
+    picImg: [],
+    // picImg[picId] = decoded <img> for that picture (or null)
+    picSrcIdx: [],
+    // picSrcIdx[picId] = index into PUZZLE_SRCS the picture uses
+    deck: [],
+    // deck[col] = array of QUEUED tile objects, TOP of stack last (next to feed = pop())
+    clearedPics: 0,
+    // pictures cleared this board
+    clearedList: [],
+    // picIds cleared this stage (in clear order) → result-screen montage
+    totalPics: 0,
+    // total pictures in this board (play + deck)
+    busy: false
+    // gravity/clear/feed sequence in progress → block input
+  };
+  var homeRowOf = (h) => h / State.cols | 0;
+  var homeColOf = (h) => h % State.cols;
+  var subColOf = (s) => s % 2;
+  var subRowOf = (s) => s >> 1;
+  function bondedRight(ca, cb) {
+    if (IS_GRAVITY) {
+      const ta = State.cell[ca], tb = State.cell[cb];
+      if (ta == null || tb == null) return false;
+      const A = State.tiles[ta], B = State.tiles[tb];
+      if (A.picId !== B.picId) return false;
+      return subRowOf(A.sub) === subRowOf(B.sub) && subColOf(A.sub) + 1 === subColOf(B.sub);
+    }
+    const ha = State.cell[ca], hb = State.cell[cb];
+    if (ha == null || hb == null) return false;
+    return homeRowOf(hb) === homeRowOf(ha) && homeColOf(hb) === homeColOf(ha) + 1;
+  }
+  function bondedBelow(ca, cb) {
+    if (IS_GRAVITY) {
+      const ta = State.cell[ca], tb = State.cell[cb];
+      if (ta == null || tb == null) return false;
+      const A = State.tiles[ta], B = State.tiles[tb];
+      if (A.picId !== B.picId) return false;
+      return subColOf(A.sub) === subColOf(B.sub) && subRowOf(A.sub) + 1 === subRowOf(B.sub);
+    }
+    const ha = State.cell[ca], hb = State.cell[cb];
+    if (ha == null || hb == null) return false;
+    return homeColOf(hb) === homeColOf(ha) && homeRowOf(hb) === homeRowOf(ha) + 1;
+  }
+  function computeBondSeams() {
+    const H = /* @__PURE__ */ new Set(), V = /* @__PURE__ */ new Set();
+    for (let ci = 0; ci < State.N; ci++) {
+      const col = ci % State.cols, row = ci / State.cols | 0;
+      if (col < State.cols - 1 && bondedRight(ci, ci + 1)) H.add(ci);
+      if (row < State.rows - 1 && bondedBelow(ci, ci + State.cols)) V.add(ci);
+    }
+    return { H, V };
+  }
+  function pairKey(a, b) {
+    return a < b ? a + "-" + b : b + "-" + a;
+  }
+  function computeBondPairs() {
+    const s = /* @__PURE__ */ new Set(), seams = computeBondSeams();
+    for (const ci of seams.H) s.add(pairKey(State.cell[ci], State.cell[ci + 1]));
+    for (const ci of seams.V) s.add(pairKey(State.cell[ci], State.cell[ci + State.cols]));
+    return s;
+  }
+  function bondCount() {
+    const s = computeBondSeams();
+    return s.H.size + s.V.size;
+  }
+  function maxSeams() {
+    return State.cols * (State.rows - 1) + State.rows * (State.cols - 1);
+  }
+  function groupCellsOf(ci) {
+    if (State.cell[ci] == null) return [];
+    const seen = /* @__PURE__ */ new Set([ci]);
+    const stack = [ci];
+    const out = [];
+    while (stack.length) {
+      const c = stack.pop();
+      out.push(c);
+      const col = c % State.cols, row = c / State.cols | 0;
+      const tryAdd = (nc) => {
+        if (nc != null && !seen.has(nc)) {
+          seen.add(nc);
+          stack.push(nc);
+        }
+      };
+      if (col > 0 && bondedRight(c - 1, c)) tryAdd(c - 1);
+      if (col < State.cols - 1 && bondedRight(c, c + 1)) tryAdd(c + 1);
+      if (row > 0 && bondedBelow(c - State.cols, c)) tryAdd(c - State.cols);
+      if (row < State.rows - 1 && bondedBelow(c, c + State.cols)) tryAdd(c + State.cols);
+    }
+    return out.sort((a, b) => a - b);
+  }
+  function layout() {
+    const wrap = document.getElementById("board-wrap");
+    const W = wrap.clientWidth, H = wrap.clientHeight;
+    DPR = Math.min(2.5, window.devicePixelRatio || 1);
+    const margin = 6;
+    const gravReserve = IS_GRAVITY ? Math.round(H * 0.05) : 0;
+    const aspect = IS_GRAVITY ? GRAV.COLS / (GRAV.TILE_RATIO * (GRAV.DECK_ROWS + GRAV.PLAY_ROWS)) : CFG.BOARD_ASPECT;
+    const fit = (aw, ah) => {
+      let w = Math.max(40, aw), h = Math.max(40, ah);
+      if (w / h > aspect) w = h * aspect;
+      else h = w / aspect;
+      return { w, h };
+    };
+    const sideR = Math.round(W * 0.02);
+    const g = fit(W - margin * 2 - sideR * 2, H - margin * 2 - gravReserve);
+    const bw = g.w, bh = g.h;
+    const gw = Math.round(bw * DPR), gh = Math.round(bh * DPR);
+    boardCanvas.width = gw;
+    boardCanvas.height = gh;
+    boardCanvas.style.width = bw + "px";
+    boardCanvas.style.height = bh + "px";
+    State.boardW = gw;
+    State.boardH = gh;
+    State.pad = 0;
+    if (IS_GRAVITY) {
+      const allRows = GRAV.DECK_ROWS + GRAV.PLAY_ROWS;
+      const unit = State.boardW / State.cols;
+      State.gap = Math.round(unit * CFG.GAP_FRAC);
+      State.gapY = State.gap;
+      State.radius = Math.round(unit * CFG.RADIUS_FRAC);
+      State.tileW = (State.boardW - (State.cols - 1) * State.gap) / State.cols;
+      State.tileH = (State.boardH - (allRows - 1) * State.gap) / allRows;
+      State.deckOffY = GRAV.DECK_ROWS * (State.tileH + State.gap);
+    } else {
+      const unit = Math.min(State.boardW / State.cols, State.boardH / State.rows);
+      const gBase = unit * CFG.GAP_FRAC * (1 - State.gridConverge);
+      setProportionalGaps(gBase);
+      State.radius = Math.round(unit * CFG.RADIUS_FRAC * (1 - State.gridConverge));
+      State.deckOffY = 0;
+    }
+    const stage = document.getElementById("stage");
+    confettiCanvas.width = Math.round(stage.clientWidth * DPR);
+    confettiCanvas.height = Math.round(stage.clientHeight * DPR);
+    confettiCanvas.style.width = stage.clientWidth + "px";
+    confettiCanvas.style.height = stage.clientHeight + "px";
+    popfxCanvas.width = Math.round(W * DPR);
+    popfxCanvas.height = Math.round(H * DPR);
+    popfxCanvas.style.width = W + "px";
+    popfxCanvas.style.height = H + "px";
+    refreshFxOff();
+    drawBoard();
+  }
+  function refreshFxOff() {
+    const wrap = document.getElementById("board-wrap");
+    if (!wrap || !boardCanvas) return;
+    const wr = wrap.getBoundingClientRect(), br = boardCanvas.getBoundingClientRect();
+    const zf = br.width / (parseFloat(boardCanvas.style.width) || br.width) || 1;
+    State.fxOffX = Math.round((br.left - wr.left) / zf * DPR);
+    State.fxOffY = Math.round((br.top - wr.top) / zf * DPR);
+  }
+  function setProportionalGaps(gBase) {
+    const denom = State.boardW * (State.rows - 1);
+    const R = denom > 0 ? State.boardH * (State.cols - 1) / denom : 1;
+    const rs = Math.sqrt(R > 0 ? R : 1);
+    State.gap = gBase / rs;
+    State.gapY = gBase * rs;
+    State.tileW = (State.boardW - (State.cols - 1) * State.gap) / State.cols;
+    State.tileH = (State.boardH - (State.rows - 1) * State.gapY) / State.rows;
+  }
+  function cellXY(ci) {
+    const col = ci % State.cols, row = ci / State.cols | 0;
+    const pad = State.pad || 0;
+    const x = pad + Math.round(col * (State.tileW + State.gap));
+    const y = pad + Math.round((State.deckOffY || 0) + row * (State.tileH + (State.gapY != null ? State.gapY : State.gap)));
+    const w = Math.round(State.tileW);
+    const h = Math.round(State.tileH);
+    return { x, y, w, h, col, row };
+  }
+  function srcRect(home) {
+    const col = home % State.cols, row = home / State.cols | 0;
+    const sw = State.puzzleImg.width / State.cols;
+    const sh = State.puzzleImg.height / State.rows;
+    return { sx: col * sw, sy: row * sh, sw, sh };
+  }
+  function gravPicColor(picId) {
+    const h = (picId * 137.508 % 360 + 360) % 360;
+    return `hsl(${h.toFixed(0)},58%,52%)`;
+  }
+  function gravTileSrc(ti) {
+    const t = State.tiles[ti];
+    if (!t) return null;
+    const img = State.picImg[t.picId];
+    if (!img) return null;
+    const sw = img.width / 2, sh = img.height / 2;
+    const sx = subColOf(t.sub) * sw, sy = subRowOf(t.sub) * sh;
+    return { img, sx, sy, sw, sh };
+  }
+  function rr(ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function rrCorners(ctx, x, y, w, h, rTL, rTR, rBR, rBL) {
+    const m = Math.min(w / 2, h / 2);
+    rTL = Math.min(rTL, m);
+    rTR = Math.min(rTR, m);
+    rBR = Math.min(rBR, m);
+    rBL = Math.min(rBL, m);
+    ctx.beginPath();
+    ctx.moveTo(x + rTL, y);
+    ctx.lineTo(x + w - rTR, y);
+    if (rTR > 0) ctx.arcTo(x + w, y, x + w, y + rTR, rTR);
+    else ctx.lineTo(x + w, y);
+    ctx.lineTo(x + w, y + h - rBR);
+    if (rBR > 0) ctx.arcTo(x + w, y + h, x + w - rBR, y + h, rBR);
+    else ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x + rBL, y + h);
+    if (rBL > 0) ctx.arcTo(x, y + h, x, y + h - rBL, rBL);
+    else ctx.lineTo(x, y + h);
+    ctx.lineTo(x, y + rTL);
+    if (rTL > 0) ctx.arcTo(x, y, x + rTL, y, rTL);
+    else ctx.lineTo(x, y);
+    ctx.closePath();
+  }
+  function edgeProgress(ci, excludeDrag) {
+    const col = ci % State.cols, row = ci / State.cols | 0;
+    const inDrag = excludeDrag ? (nc) => State.dragging && State.dragging.groupSet && State.dragging.groupSet.has(nc) : () => false;
+    const eL = col > 0 && !inDrag(ci - 1) && bondedRight(ci - 1, ci) ? State.bondH[ci - 1] || 0 : 0;
+    const eR = col < State.cols - 1 && !inDrag(ci + 1) && bondedRight(ci, ci + 1) ? State.bondH[ci] || 0 : 0;
+    const eT = row > 0 && !inDrag(ci - State.cols) && bondedBelow(ci - State.cols, ci) ? State.bondV[ci - State.cols] || 0 : 0;
+    const eB = row < State.rows - 1 && !inDrag(ci + State.cols) && bondedBelow(ci, ci + State.cols) ? State.bondV[ci] || 0 : 0;
+    return { l: eL, r: eR, t: eT, b: eB };
+  }
+  function drawTile(ctx, ti, x, y, opts) {
+    opts = opts || {};
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    const scale = opts.scale == null ? 1 : opts.scale;
+    const scaleX = (opts.scaleX == null ? 1 : opts.scaleX) * scale;
+    const w = opts.w != null ? opts.w : State.tileW;
+    const h = opts.h != null ? opts.h : State.tileH;
+    const tile = State.tiles[ti];
+    const E = opts.edges || { l: 0, r: 0, t: 0, b: 0 };
+    const gapYv = State.gapY != null ? State.gapY : State.gap;
+    const ghX = State.gap / 2 + 0.9 * DPR, ghY = gapYv / 2 + 0.9 * DPR;
+    const exL = ghX * E.l, exR = ghX * E.r, exT = ghY * E.t, exB = ghY * E.b;
+    const W = w + exL + exR, H = h + exT + exB;
+    ctx.save();
+    if (opts.pivot) {
+      const s = scale, pv = opts.pivot;
+      ctx.translate(pv.x + s * (x - pv.x), pv.y + s * (y - pv.y));
+      ctx.scale(s, s);
+    } else {
+      const cx = x + w / 2, cy = y + h / 2;
+      ctx.translate(cx, cy);
+      ctx.scale(scaleX, scale);
+      ctx.translate(-w / 2, -h / 2);
+    }
+    if (opts.shadow) {
+      ctx.shadowColor = "rgba(0,0,0,0.45)";
+      ctx.shadowBlur = 18 * DPR;
+      ctx.shadowOffsetY = 10 * DPR;
+    }
+    const R = State.radius;
+    const rTL = R * (1 - Math.max(E.t, E.l));
+    const rTR = R * (1 - Math.max(E.t, E.r));
+    const rBR = R * (1 - Math.max(E.b, E.r));
+    const rBL = R * (1 - Math.max(E.b, E.l));
+    rrCorners(ctx, -exL, -exT, W, H, rTL, rTR, rBR, rBL);
+    ctx.save();
+    ctx.clip();
+    const backA = opts.backAlpha != null ? opts.backAlpha : tile.faceUp ? 1 - tile.reveal : 1;
+    const faceA = opts.faceAlpha != null ? opts.faceAlpha : tile.faceUp ? tile.reveal : 0;
+    if (backA > 1e-3 && State.cardBack) {
+      ctx.globalAlpha = backA;
+      ctx.drawImage(State.cardBack, -exL, -exT, W, H);
+    }
+    if (faceA > 1e-3) {
+      ctx.globalAlpha = faceA;
+      if (IS_GRAVITY) {
+        const g = gravTileSrc(ti);
+        if (g) {
+          const sxPerPx = g.sw / w, syPerPx = g.sh / h;
+          const ssx = g.sx - exL * sxPerPx, ssy = g.sy - exT * syPerPx;
+          const ssw = g.sw + (exL + exR) * sxPerPx, ssh = g.sh + (exT + exB) * syPerPx;
+          ctx.drawImage(g.img, ssx, ssy, ssw, ssh, -exL, -exT, W, H);
+        } else {
+          ctx.fillStyle = gravPicColor(tile.picId);
+          ctx.fillRect(-exL, -exT, W, H);
+        }
+      } else if (State.puzzleImg) {
+        const s = srcRect(tile.home);
+        const sxPerPx = s.sw / w, syPerPx = s.sh / h;
+        const ssx = s.sx - exL * sxPerPx, ssy = s.sy - exT * syPerPx;
+        const ssw = s.sw + (exL + exR) * sxPerPx, ssh = s.sh + (exT + exB) * syPerPx;
+        ctx.drawImage(State.puzzleImg, ssx, ssy, ssw, ssh, -exL, -exT, W, H);
+      }
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    ctx.shadowColor = "transparent";
+    const rimBase = CFG.BORDER_A * (1 - State.gridConverge);
+    if (rimBase > 3e-3) {
+      const inset = 0.75 * DPR;
+      ctx.lineWidth = 1.2 * DPR;
+      const x0 = inset, y0 = inset, x1 = w - inset, y1 = h - inset;
+      const strokeEdge = (ax, ay, bx, by, prog) => {
+        const a = rimBase * (1 - prog);
+        if (a <= 3e-3) return;
+        ctx.strokeStyle = "rgba(255,255,255," + a.toFixed(3) + ")";
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+      };
+      const cR = Math.max(0, R - inset);
+      const cTL = cR * (1 - Math.max(E.t, E.l)), cTR = cR * (1 - Math.max(E.t, E.r));
+      const cBR = cR * (1 - Math.max(E.b, E.r)), cBL = cR * (1 - Math.max(E.b, E.l));
+      strokeEdge(x0 + cTL, y0, x1 - cTR, y0, E.t);
+      strokeEdge(x1, y0 + cTR, x1, y1 - cBR, E.r);
+      strokeEdge(x1 - cBR, y1, x0 + cBL, y1, E.b);
+      strokeEdge(x0, y1 - cBL, x0, y0 + cTL, E.l);
+      const arc = (cxr, cyr, r, a0, a1, prog) => {
+        if (r <= 0.5) return;
+        const al = rimBase * (1 - prog);
+        if (al <= 3e-3) return;
+        ctx.strokeStyle = "rgba(255,255,255," + al.toFixed(3) + ")";
+        ctx.beginPath();
+        ctx.arc(cxr, cyr, r, a0, a1);
+        ctx.stroke();
+      };
+      arc(x0 + cTL, y0 + cTL, cTL, Math.PI, 1.5 * Math.PI, Math.max(E.t, E.l));
+      arc(x1 - cTR, y0 + cTR, cTR, 1.5 * Math.PI, 2 * Math.PI, Math.max(E.t, E.r));
+      arc(x1 - cBR, y1 - cBR, cBR, 0, 0.5 * Math.PI, Math.max(E.b, E.r));
+      arc(x0 + cBL, y1 - cBL, cBL, 0.5 * Math.PI, Math.PI, Math.max(E.b, E.l));
+    }
+    ctx.restore();
+  }
+  function drawDeck() {
+    if (!IS_GRAVITY) return;
+    const h = Math.round(State.tileH);
+    const maxSliver = Math.max(7 * DPR, Math.round(h * 0.12));
+    const pad = State.pad || 0;
+    const frontBottom = pad + (State.deckOffY || 0) - State.gap;
+    const avail = (State.deckOffY || 0) - State.gap - h;
+    for (let col = 0; col < State.cols; col++) {
+      const stack = State.deck[col] || [];
+      const x = pad + Math.round(col * (State.tileW + State.gap));
+      const resting = stack.filter((c) => !c.anim);
+      const n = resting.length;
+      const sliver = n > 1 ? Math.max(2 * DPR, Math.min(maxSliver, avail / (n - 1))) : maxSliver;
+      for (let k = 0; k < n; k++) {
+        const i = n - 1 - k;
+        const depth = n - 1 - i;
+        const y = frontBottom - h - depth * sliver;
+        bctx.save();
+        bctx.globalAlpha = GRAV.DECK_DIM;
+        drawDeckCard(resting[i], x, y, null);
+        bctx.restore();
+      }
+      for (const card of stack) {
+        if (card.anim) {
+          bctx.save();
+          if (card.anim.faceAlpha == null) bctx.globalAlpha = GRAV.DECK_DIM;
+          drawDeckCard(card, card.anim.x, card.anim.y, card.anim);
+          bctx.restore();
+        }
+      }
+    }
+  }
+  function drawDeckCard(card, x, y, a) {
+    const w = Math.round(State.tileW), h = Math.round(State.tileH);
+    const ti = card.tileIdx;
+    if (ti >= 0 && a) {
+      drawTile(bctx, ti, x, y, { w, h, scaleX: a.scaleX, backAlpha: a.backAlpha, faceAlpha: a.faceAlpha, edges: { l: 0, r: 0, t: 0, b: 0 } });
+      return;
+    }
+    if (State.cardBack) {
+      bctx.save();
+      rrCorners(bctx, x, y, w, h, State.radius, State.radius, State.radius, State.radius);
+      bctx.shadowColor = "rgba(0,0,0,0.45)";
+      bctx.shadowBlur = 6 * DPR;
+      bctx.shadowOffsetY = 5 * DPR;
+      bctx.fillStyle = "#2f6fe0";
+      bctx.fill();
+      bctx.shadowColor = "transparent";
+      bctx.clip();
+      bctx.drawImage(State.cardBack, x, y, w, h);
+      bctx.restore();
+      bctx.save();
+      rrCorners(bctx, x + 0.5 * DPR, y + 0.5 * DPR, w - DPR, h - DPR, State.radius, State.radius, State.radius, State.radius);
+      bctx.lineWidth = 1.5 * DPR;
+      bctx.strokeStyle = "rgba(255,255,255,0.30)";
+      bctx.stroke();
+      bctx.restore();
+    }
+  }
+  var staticC = null;
+  var staticCtx = null;
+  var staticSig = "";
+  var staticGen = 0;
+  function invalidateStaticCache() {
+    staticGen++;
+    staticSig = "";
+  }
+  function staticCacheUsable() {
+    const ph = State.phase;
+    if (ph !== "play" && ph !== "swapping" && ph !== "complete") return false;
+    const gc = State.gridConverge;
+    return gc <= 1e-4 || gc >= 0.9999;
+  }
+  function drawBoard() {
+    bctx.clearRect(0, 0, boardCanvas.width, boardCanvas.height);
+    drawDeck();
+    const dragSet = State.dragging && State.dragging.groupSet || null;
+    const top = [];
+    const useCache = false;
+    if (useCache && staticCacheUsable()) {
+      let sig = staticGen + "|" + State.gap + "|" + State.radius + "|" + State.boardW + "x" + State.boardH + "|" + (State.gridConverge >= 0.9999 ? "C" : "O") + "|";
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        if (dragSet && dragSet.has(ci)) continue;
+        const a = State.tiles[ti].anim;
+        if (a) continue;
+        sig += ci + ":" + ti + ",";
+      }
+      if (sig !== staticSig || !staticC) {
+        if (!staticC || staticC.width !== boardCanvas.width || staticC.height !== boardCanvas.height) {
+          staticC = document.createElement("canvas");
+          staticC.width = boardCanvas.width;
+          staticC.height = boardCanvas.height;
+          staticCtx = staticC.getContext("2d");
+        }
+        staticCtx.clearRect(0, 0, staticC.width, staticC.height);
+        for (let ci = 0; ci < State.N; ci++) {
+          const ti = State.cell[ci];
+          if (ti == null) continue;
+          if (dragSet && dragSet.has(ci)) continue;
+          if (State.tiles[ti].anim) continue;
+          const p = cellXY(ci);
+          drawTile(staticCtx, ti, p.x, p.y, { w: p.w, h: p.h, edges: edgeProgress(ci, true) });
+        }
+        staticSig = sig;
+      }
+      bctx.drawImage(staticC, 0, 0);
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        if (dragSet && dragSet.has(ci)) continue;
+        const a = State.tiles[ti].anim;
+        if (!a) continue;
+        if (a.pivot || a.top) {
+          top.push({ ci, ti, a });
+          continue;
+        }
+        const E = a.edges || edgeProgress(ci, true);
+        drawTile(bctx, ti, a.x, a.y, { scale: a.scale, scaleX: a.scaleX, shadow: a.shadow, backAlpha: a.backAlpha, faceAlpha: a.faceAlpha, edges: E });
+      }
+    } else {
+      staticSig = "";
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        if (dragSet && dragSet.has(ci)) continue;
+        const a = State.tiles[ti].anim;
+        if (a && (a.pivot || a.top)) {
+          top.push({ ci, ti, a });
+          continue;
+        }
+        if (a) {
+          const E = a.edges || edgeProgress(ci, true);
+          drawTile(bctx, ti, a.x, a.y, { scale: a.scale, scaleX: a.scaleX, shadow: a.shadow, backAlpha: a.backAlpha, faceAlpha: a.faceAlpha, edges: E });
+        } else {
+          const p = cellXY(ci);
+          drawTile(bctx, ti, p.x, p.y, { w: p.w, h: p.h, edges: edgeProgress(ci, true) });
+        }
+      }
+    }
+    drawPopFx(top);
+  }
+  function drawPopFx(top) {
+    if (!pfx) return;
+    pfx.clearRect(0, 0, popfxCanvas.width, popfxCanvas.height);
+    const hasGlow = State.fx && State.fx.glow > 0.01;
+    if (!top.length && !hasGlow) return;
+    refreshFxOff();
+    pfx.save();
+    pfx.translate(State.fxOffX || 0, State.fxOffY || 0);
+    if (hasGlow) drawBlockGlow(pfx, State.fx);
+    for (const { ci, ti, a } of top) {
+      const E = a.edges || edgeProgress(ci, true);
+      drawTile(pfx, ti, a.x, a.y, { scale: a.scale, scaleX: a.scaleX, shadow: a.shadow, backAlpha: a.backAlpha, faceAlpha: a.faceAlpha, edges: E, pivot: a.pivot });
+    }
+    pfx.restore();
+  }
+  var GLOW_DS = 0.5;
+  function buildGlowSprite(fx) {
+    const cells = fx.cells;
+    if (!cells || !cells.length) return null;
+    const r = State.radius > 0 ? State.radius : 6 * DPR;
+    const pad = (State.gap || 0) / 2 + 1.5 * DPR;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const c of cells) {
+      const p = cellXY(c);
+      if (p.x - pad < minX) minX = p.x - pad;
+      if (p.y - pad < minY) minY = p.y - pad;
+      if (p.x + p.w + pad > maxX) maxX = p.x + p.w + pad;
+      if (p.y + p.h + pad > maxY) maxY = p.y + p.h + pad;
+    }
+    const margin = Math.ceil(22 * DPR + 4 * DPR);
+    const ox = Math.floor(minX - margin), oy = Math.floor(minY - margin);
+    const fw = Math.ceil(maxX + margin) - ox, fh = Math.ceil(maxY + margin) - oy;
+    if (fw <= 0 || fh <= 0) return null;
+    const ds = GLOW_DS;
+    const cnv = document.createElement("canvas");
+    cnv.width = Math.max(1, Math.round(fw * ds));
+    cnv.height = Math.max(1, Math.round(fh * ds));
+    const g = cnv.getContext("2d");
+    g.scale(ds, ds);
+    g.translate(-ox, -oy);
+    g.shadowColor = "rgba(255,255,255,0.95)";
+    g.fillStyle = "rgba(255,255,255,0.9)";
+    for (const blur of [22, 10]) {
+      g.shadowBlur = blur * DPR;
+      for (const c of cells) {
+        const p = cellXY(c);
+        rr(g, p.x - pad, p.y - pad, p.w + 2 * pad, p.h + 2 * pad, r);
+        g.fill();
+      }
+    }
+    fx._glowC = cnv;
+    fx._glowOX = ox;
+    fx._glowOY = oy;
+    fx._glowDS = ds;
+    try {
+      pfx.drawImage(cnv, -9999, -9999, 1, 1);
+    } catch (_) {
+    }
+    return cnv;
+  }
+  function drawBlockGlow(ctx, fx) {
+    if (!fx._glowC) {
+      if (!buildGlowSprite(fx)) return;
+    }
+    const cells = fx.cells;
+    if (!cells || !cells.length) return;
+    const s = fx.scale, pv = fx.pivot;
+    const inv = 1 / (fx._glowDS || 1);
+    const fw = fx._glowC.width * inv, fh = fx._glowC.height * inv;
+    const dx = pv.x + s * (fx._glowOX - pv.x);
+    const dy = pv.y + s * (fx._glowOY - pv.y);
+    ctx.save();
+    ctx.globalAlpha = clamp01(fx.glow);
+    ctx.drawImage(fx._glowC, dx, dy, fw * s, fh * s);
+    ctx.restore();
+  }
+  var rafId = 0;
+  function ensureLoop() {
+    if (!rafId) rafId = requestAnimationFrame(tick);
+  }
+  function recoverFromStuck() {
+    State.anims.length = 0;
+    State.fx = null;
+    for (const t of State.tiles) {
+      if (t) t.anim = null;
+    }
+    State.busy = false;
+    State.dragging = null;
+    if (State.phase !== "complete") State.phase = "play";
+    try {
+      drawBoard();
+    } catch (_) {
+    }
+  }
+  function tick() {
+    rafId = 0;
+    try {
+      const t = now();
+      let alive = false;
+      for (let i = State.anims.length - 1; i >= 0; i--) {
+        const a = State.anims[i];
+        const done = a.update(t);
+        if (done) {
+          a.finish && a.finish();
+          State.anims.splice(i, 1);
+        } else alive = true;
+      }
+      if (confettiActive) {
+        stepConfetti(t);
+        alive = true;
+      }
+      drawBoard();
+      if (alive || confettiActive) rafId = requestAnimationFrame(tick);
+      else if (State.gridConverge >= 1) drawBoard();
+    } catch (e) {
+      try {
+        console.error("[pp] anim loop recovered from error:", e && e.message);
+      } catch (_) {
+      }
+      recoverFromStuck();
+    }
+  }
+  function dealIn(onDone) {
+    State.phase = "deal";
+    const t0 = now();
+    const boardH = State.boardH;
+    const boardW = State.boardW;
+    let remaining = 0;
+    for (let ci = 0; ci < State.N; ci++) if (State.cell[ci] != null) remaining++;
+    if (remaining === 0) {
+      onDone && onDone();
+      return;
+    }
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti = State.cell[ci];
+      if (ti == null) continue;
+      const tile = State.tiles[ti];
+      tile.faceUp = false;
+      tile.reveal = 0;
+      const p = cellXY(ci);
+      const start = t0 + ci * CFG.DEAL_STAGGER;
+      const dur = CFG.DEAL_DUR;
+      const fromY = p.y + boardH * CFG.DEAL_FROM_Y;
+      const fromX = p.x + (ci % State.cols - (State.cols - 1) / 2) * boardW * CFG.DEAL_FROM_SPREADX;
+      tile.anim = { x: fromX, y: fromY, scale: 1, shadow: false, backAlpha: 1, faceAlpha: 0 };
+      State.anims.push({
+        update(t) {
+          if (t < start) {
+            return false;
+          }
+          const k = clamp01((t - start) / dur);
+          const e = easeOut(k);
+          tile.anim.x = lerp(fromX, p.x, e);
+          tile.anim.y = lerp(fromY, p.y, e);
+          const bk = k > 0.78 ? (k - 0.78) / 0.22 : 0;
+          tile.anim.scale = 1 + Math.sin(bk * Math.PI) * CFG.DEAL_BOUNCE;
+          return k >= 1;
+        },
+        finish() {
+          tile.anim = null;
+          if (IS_GRAVITY) haptic("selection");
+          if (--remaining === 0) onDone && onDone();
+        }
+        // gravity: tap as each dealt piece LANDS (user req)
+      });
+    }
+    ensureLoop();
+  }
+  function reveal(onDone) {
+    State.phase = "reveal";
+    const t0 = now() + CFG.REVEAL_DELAY;
+    let remaining = 0;
+    for (let ci = 0; ci < State.N; ci++) if (State.cell[ci] != null) remaining++;
+    if (remaining === 0) {
+      onDone && onDone();
+      return;
+    }
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti = State.cell[ci];
+      if (ti == null) continue;
+      const tile = State.tiles[ti];
+      tile.faceUp = true;
+      tile.reveal = 0;
+      const p = cellXY(ci);
+      const start = t0 + ci * CFG.REVEAL_STAGGER;
+      const dur = CFG.REVEAL_DUR;
+      tile.anim = { x: p.x, y: p.y, scale: 1, scaleX: 1, shadow: false, backAlpha: 1, faceAlpha: 0 };
+      State.anims.push({
+        update(t) {
+          if (t < start) return false;
+          const k = clamp01((t - start) / dur);
+          const half = k < 0.5;
+          tile.anim.scaleX = Math.abs(Math.cos(k * Math.PI));
+          tile.anim.backAlpha = half ? 1 : 0;
+          tile.anim.faceAlpha = half ? 0 : 1;
+          tile.reveal = half ? 0 : 1;
+          return k >= 1;
+        },
+        finish() {
+          tile.anim = null;
+          tile.reveal = 1;
+          if (--remaining === 0) onDone && onDone();
+        }
+      });
+    }
+    ensureLoop();
+  }
+  function applyBlockSwap(group, tDcol, tDrow) {
+    const cols = State.cols;
+    const before = State.cell.slice();
+    const groupSet = new Set(group);
+    const newFootprint = group.map((ci) => ((ci / cols | 0) + tDrow) * cols + (ci % cols + tDcol));
+    const newSet = new Set(newFootprint);
+    const freed = group.filter((ci) => !newSet.has(ci));
+    const displaced = newFootprint.filter((nc) => !groupSet.has(nc));
+    const freedSet = new Set(freed), usedFreed = /* @__PURE__ */ new Set(), leftover = [];
+    const assign = {};
+    for (const d of displaced) {
+      const cand = ((d / cols | 0) - tDrow) * cols + (d % cols - tDcol);
+      if (freedSet.has(cand) && !usedFreed.has(cand)) {
+        usedFreed.add(cand);
+        assign[d] = cand;
+      } else leftover.push(d);
+    }
+    const remainingFreed = freed.filter((c) => !usedFreed.has(c));
+    leftover.forEach((d, k) => {
+      assign[d] = remainingFreed[k];
+    });
+    const moves = [];
+    group.forEach((ci, i) => {
+      moves.push({ ti: before[ci], fromCell: ci, toCell: newFootprint[i] });
+    });
+    for (const d of displaced) {
+      moves.push({ ti: before[d], fromCell: d, toCell: assign[d] });
+    }
+    const result = before.slice();
+    for (const m of moves) result[m.toCell] = m.ti;
+    State.cell = result;
+    return moves;
+  }
+  function animateMoves(moves, grabbedGroup, bounceCells, emphasisCells, onDone) {
+    State.phase = "swapping";
+    const t0 = now();
+    const cols = State.cols;
+    moves = moves.filter((m) => State.tiles[m.ti] != null);
+    const groupSet = new Set(grabbedGroup);
+    const emphSet = emphasisCells ? new Set(emphasisCells) : null;
+    const grabbedEmph = !!(emphSet && bounceCells.some((c) => emphSet.has(c)));
+    const sepEmph = emphSet && !grabbedEmph ? emphasisCells : null;
+    const sepEmphSet = sepEmph ? new Set(sepEmph) : null;
+    const destTrans = {};
+    for (const m of moves) {
+      destTrans[m.toCell] = m.toCell % cols - m.fromCell % cols + "," + ((m.toCell / cols | 0) - (m.fromCell / cols | 0));
+    }
+    function movingEdges(dc) {
+      const col = dc % cols, row = dc / cols | 0, tr = destTrans[dc], e = { l: 0, r: 0, t: 0, b: 0 };
+      if (col < cols - 1 && destTrans[dc + 1] === tr && bondedRight(dc, dc + 1)) e.r = 1;
+      if (col > 0 && destTrans[dc - 1] === tr && bondedRight(dc - 1, dc)) e.l = 1;
+      if (row < State.rows - 1 && destTrans[dc + cols] === tr && bondedBelow(dc, dc + cols)) e.b = 1;
+      if (row > 0 && destTrans[dc - cols] === tr && bondedBelow(dc - cols, dc)) e.t = 1;
+      return e;
+    }
+    const groupMoves = moves.filter((m) => groupSet.has(m.fromCell));
+    const sepEmphMoves = sepEmphSet ? moves.filter((m) => !groupSet.has(m.fromCell) && sepEmphSet.has(m.toCell)) : [];
+    const plainDisplaced = moves.length - groupMoves.length - sepEmphMoves.length;
+    let settleLeft = plainDisplaced + (sepEmphMoves.length ? 1 : 0) + (groupMoves.length ? 1 : 0);
+    let groupTweensLeft = groupMoves.length;
+    let sepTweensLeft = sepEmphMoves.length;
+    const done = () => {
+      if (--settleLeft <= 0) {
+        State.phase = "play";
+        onDone && onDone();
+      }
+    };
+    if (settleLeft <= 0) {
+      State.phase = "play";
+      onDone && onDone();
+      return;
+    }
+    for (const m of moves) {
+      const tile = State.tiles[m.ti];
+      const from = m.fromXY || cellXY(m.fromCell);
+      const to = cellXY(m.toCell);
+      const isGroup = groupSet.has(m.fromCell);
+      const isSepEmph = !isGroup && sepEmphSet && sepEmphSet.has(m.toCell);
+      const edges = movingEdges(m.toCell);
+      tile.anim = { x: from.x, y: from.y, scale: 1, shadow: false, edges, top: isGroup };
+      State.anims.push({
+        update(t) {
+          const k = clamp01((t - t0) / CFG.SWAP_DUR);
+          const e = easeInOut(k);
+          tile.anim.x = lerp(from.x, to.x, e);
+          tile.anim.y = lerp(from.y, to.y, e);
+          return k >= 1;
+        },
+        finish() {
+          if (isGroup) {
+            tile.anim = { x: to.x, y: to.y, scale: 1, shadow: false, edges, top: true };
+            if (--groupTweensLeft <= 0) bounceGroup(bounceCells, grabbedEmph, done);
+          } else if (isSepEmph) {
+            tile.anim = { x: to.x, y: to.y, scale: 1, shadow: false, edges };
+            if (--sepTweensLeft <= 0) bounceGroup(sepEmph, true, done);
+          } else {
+            bounce(m.ti, to, done);
+          }
+        }
+      });
+    }
+    if (IS_GRAVITY) haptic("light");
+    ensureLoop();
+  }
+  var __dbgEmph = 0;
+  function bounceGroup(cells, emphasis, onDone) {
+    if (!cells || !cells.length) {
+      onDone && onDone();
+      return;
+    }
+    if (emphasis) __dbgEmph++;
+    let gx = 0, gy = 0;
+    for (const c of cells) {
+      const p = cellXY(c);
+      gx += p.x + p.w / 2;
+      gy += p.y + p.h / 2;
+    }
+    const pivot = { x: gx / cells.length, y: gy / cells.length };
+    const over = emphasis ? CFG.BOUNCE_OVER * 0.5 : 0;
+    const dur = emphasis ? 300 : CFG.BOUNCE_DUR;
+    const t0 = now();
+    const fx = emphasis ? { cells, glow: 0, scale: 1, pivot, _glowC: null } : null;
+    if (fx) State.fx = fx;
+    State.anims.push({
+      update(t) {
+        const k = clamp01((t - t0) / dur);
+        const s = 1 + Math.sin(k * Math.PI) * over;
+        for (const c of cells) {
+          const ti = State.cell[c];
+          if (ti == null) continue;
+          const p = cellXY(c);
+          State.tiles[ti].anim = { x: p.x, y: p.y, scale: s, pivot, shadow: false };
+        }
+        if (fx) {
+          fx.glow = Math.sin(k * Math.PI);
+          fx.scale = s;
+        }
+        return k >= 1;
+      },
+      finish() {
+        for (const c of cells) {
+          const ti = State.cell[c];
+          if (ti != null) State.tiles[ti].anim = null;
+        }
+        State.fx = null;
+        onDone && onDone();
+      }
+    });
+    ensureLoop();
+  }
+  function playMerge(newSeams) {
+    const t0 = now();
+    const items = [];
+    for (const ci of newSeams.H) {
+      State.bondH[ci] = 0;
+      items.push(["H", ci]);
+    }
+    for (const ci of newSeams.V) {
+      State.bondV[ci] = 0;
+      items.push(["V", ci]);
+    }
+    if (!items.length) return;
+    State.anims.push({
+      update(t) {
+        const k = clamp01((t - t0) / CFG.MERGE_DUR);
+        const e = easeOut(k);
+        for (const [ax, ci] of items) {
+          if (ax === "H") State.bondH[ci] = e;
+          else State.bondV[ci] = e;
+        }
+        return k >= 1;
+      },
+      finish() {
+        for (const [ax, ci] of items) {
+          if (ax === "H") State.bondH[ci] = 1;
+          else State.bondV[ci] = 1;
+        }
+      }
+    });
+    ensureLoop();
+  }
+  function syncBondProgress() {
+    const s = computeBondSeams();
+    for (let ci = 0; ci < State.N; ci++) {
+      State.bondH[ci] = s.H.has(ci) ? 1 : 0;
+      State.bondV[ci] = s.V.has(ci) ? 1 : 0;
+    }
+    return s;
+  }
+  function bounce(ti, at, onDone) {
+    const tile = State.tiles[ti];
+    const t0 = now();
+    tile.anim = { x: at.x, y: at.y, scale: 1, shadow: false, edges: null };
+    State.anims.push({
+      update(t) {
+        const k = clamp01((t - t0) / CFG.BOUNCE_DUR);
+        tile.anim.scale = 1 + Math.sin(k * Math.PI) * CFG.BOUNCE_OVER;
+        return k >= 1;
+      },
+      finish() {
+        tile.anim = null;
+        onDone && onDone();
+      }
+    });
+    ensureLoop();
+  }
+  function returnGroup(group, liftDX, liftDY, onDone) {
+    State.phase = "swapping";
+    let remaining = group.length;
+    const t0 = now();
+    for (const ci of group) {
+      const ti = State.cell[ci];
+      const tile = State.tiles[ti];
+      const p = cellXY(ci);
+      const from = { x: p.x + liftDX, y: p.y + liftDY };
+      tile.anim = { x: from.x, y: from.y, scale: CFG.PICK_SCALE, shadow: true, edges: null };
+      State.anims.push({
+        update(t) {
+          const k = clamp01((t - t0) / CFG.RETURN_DUR);
+          const e = easeOut(k);
+          tile.anim.x = lerp(from.x, p.x, e);
+          tile.anim.y = lerp(from.y, p.y, e);
+          tile.anim.scale = lerp(CFG.PICK_SCALE, 1, e);
+          tile.anim.shadow = k < 0.9;
+          return k >= 1;
+        },
+        finish() {
+          tile.anim = null;
+          if (--remaining === 0) {
+            State.phase = "play";
+            onDone && onDone();
+          }
+        }
+      });
+    }
+    ensureLoop();
+  }
+  function resolveMove(originCell, targetCell, liftDX, liftDY) {
+    liftDX = liftDX || 0;
+    liftDY = liftDY || 0;
+    const group = groupCellsOf(originCell);
+    if (!group.length) return false;
+    let dcol = targetCell % State.cols - originCell % State.cols;
+    let drow = (targetCell / State.cols | 0) - (originCell / State.cols | 0);
+    let minCol = Infinity, maxCol = -Infinity, minRow = Infinity, maxRow = -Infinity;
+    for (const ci of group) {
+      const c = ci % State.cols, r = ci / State.cols | 0;
+      if (c < minCol) minCol = c;
+      if (c > maxCol) maxCol = c;
+      if (r < minRow) minRow = r;
+      if (r > maxRow) maxRow = r;
+    }
+    if (minCol + dcol < 0) dcol = -minCol;
+    if (maxCol + dcol > State.cols - 1) dcol = State.cols - 1 - maxCol;
+    if (minRow + drow < 0) drow = -minRow;
+    if (maxRow + drow > State.rows - 1) drow = State.rows - 1 - maxRow;
+    if (dcol === 0 && drow === 0) {
+      returnGroup(group, liftDX, liftDY, () => {
+        drawBoard();
+      });
+      return true;
+    }
+    const beforePairs = computeBondPairs();
+    const fromXY = {};
+    for (const m of [].concat(group)) {
+      const p = cellXY(m);
+      fromXY[m] = { x: p.x + liftDX, y: p.y + liftDY };
+    }
+    const moves = applyBlockSwap(group, dcol, drow);
+    tutOnMove();
+    const groupSet = new Set(group);
+    for (const m of moves) {
+      m.fromXY = groupSet.has(m.fromCell) ? fromXY[m.fromCell] : cellXY(m.fromCell);
+    }
+    syncBondProgress();
+    const afterSeams = computeBondSeams();
+    const afterBondCount = afterSeams.H.size + afterSeams.V.size;
+    const newSeams = { H: [], V: [] };
+    for (const ci of afterSeams.H) if (!beforePairs.has(pairKey(State.cell[ci], State.cell[ci + 1]))) newSeams.H.push(ci);
+    for (const ci of afterSeams.V) if (!beforePairs.has(pairKey(State.cell[ci], State.cell[ci + State.cols]))) newSeams.V.push(ci);
+    const formedNewBond = newSeams.H.length + newSeams.V.length > 0;
+    const gcols = State.cols;
+    const grabbedNewCell0 = ((group[0] / gcols | 0) + drow) * gcols + (group[0] % gcols + dcol);
+    const bounceCells = groupCellsOf(grabbedNewCell0);
+    let emphasisCells = null;
+    if (formedNewBond) {
+      const newBondCells = [];
+      for (const ci of newSeams.H) {
+        newBondCells.push(ci, ci + 1);
+      }
+      for (const ci of newSeams.V) {
+        newBondCells.push(ci, ci + gcols);
+      }
+      const grabbedSet = new Set(bounceCells);
+      const seed = newBondCells.find((c) => grabbedSet.has(c));
+      emphasisCells = groupCellsOf(seed != null ? seed : newBondCells[0]);
+      if (IS_GRAVITY) {
+        const willClear = findCompletePicture();
+        if (willClear) {
+          const cs = new Set(willClear);
+          if (emphasisCells.some((c) => cs.has(c))) emphasisCells = null;
+        }
+      }
+    }
+    animateMoves(moves, group, bounceCells, emphasisCells, () => {
+      drawBoard();
+      if (IS_GRAVITY) {
+        gravityResolveAfterMove();
+        return;
+      }
+      if (isComplete()) {
+        onComplete();
+        return;
+      }
+    });
+    if (formedNewBond) {
+      playMerge(newSeams);
+      haptic("light");
+      SFX.play("snap");
+      showPraise(afterBondCount / maxSeams());
+    } else {
+      SFX.play("place", 0.5);
+    }
+    return true;
+  }
+  function isComplete() {
+    if (IS_GRAVITY) {
+      if (State.clearedPics < State.totalPics) return false;
+      for (let ci = 0; ci < State.N; ci++) if (State.cell[ci] != null) return false;
+      for (let col = 0; col < State.cols; col++) if ((State.deck[col] || []).length) return false;
+      return true;
+    }
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti = State.cell[ci];
+      if (ti == null || State.tiles[ti].home !== ci) return false;
+    }
+    return true;
+  }
+  var praiseEl = document.getElementById("praise");
+  var praiseRaf = 0;
+  function showPraise(frac) {
+    const idx = Math.min(PRAISE.length - 1, Math.max(0, Math.floor(frac * PRAISE.length)));
+    const p = PRAISE[idx];
+    praiseEl.src = p.img;
+    praiseEl.alt = p.word;
+    const t0 = now(), IN = CFG.PRAISE_IN, HOLD = CFG.PRAISE_HOLD, OUT = CFG.PRAISE_OUT, total = IN + HOLD + OUT;
+    if (praiseRaf) cancelAnimationFrame(praiseRaf);
+    (function step() {
+      const t = now() - t0;
+      let scale, opacity, dy = 0;
+      if (t < IN) {
+        const e = easeOutBack(clamp01(t / IN));
+        scale = 0.4 + 0.6 * e;
+        opacity = clamp01(t / IN * 2);
+      } else if (t < IN + HOLD) {
+        scale = 1;
+        opacity = 1;
+      } else {
+        const k = clamp01((t - IN - HOLD) / OUT);
+        scale = 1 + 0.08 * k;
+        opacity = 1 - k;
+        dy = -28 * k;
+      }
+      praiseEl.style.transform = `translate(-50%, calc(-50% + ${dy}px)) scale(${scale})`;
+      praiseEl.style.opacity = String(opacity);
+      if (t < total) praiseRaf = requestAnimationFrame(step);
+      else {
+        praiseEl.style.opacity = "0";
+        praiseRaf = 0;
+      }
+    })();
+  }
+  function onComplete() {
+    State.phase = "complete";
+    haptic("medium");
+    SFX.play("complete");
+    if (IS_GRAVITY) {
+      drawBoard();
+      fireConfetti();
+      showBanner();
+      startMontage();
+      if (GR.active && RT.shouldEmitGameEnd(State.level)) {
+        setTimeout(() => {
+          try {
+            GR.gameEnd(true, State.level);
+          } catch (e) {
+          }
+        }, 600);
+      }
+      return;
+    }
+    syncBondProgress();
+    const t0 = now();
+    State.anims.push({
+      update(t) {
+        const k = clamp01((t - t0) / CFG.CONVERGE_DUR);
+        State.gridConverge = easeInOut(k);
+        const unit = Math.min(State.boardW / State.cols, State.boardH / State.rows);
+        State.radius = Math.round(unit * CFG.RADIUS_FRAC * (1 - State.gridConverge));
+        setProportionalGaps(unit * CFG.GAP_FRAC * (1 - State.gridConverge));
+        return k >= 1;
+      },
+      finish() {
+        State.gridConverge = 1;
+        fireConfetti();
+        showBanner();
+      }
+    });
+    ensureLoop();
+    if (GR.active && RT.shouldEmitGameEnd(State.level)) {
+      setTimeout(() => {
+        try {
+          GR.gameEnd(true, State.level);
+        } catch (e) {
+        }
+      }, 600);
+    }
+  }
+  function findCompletePicture() {
+    const cols = State.cols, rows = State.rows;
+    for (let r = 0; r < rows - 1; r++) {
+      for (let c = 0; c < cols - 1; c++) {
+        const tl = r * cols + c, tr = tl + 1, bl = tl + cols, br = bl + 1;
+        const a = State.cell[tl], b = State.cell[tr], d = State.cell[bl], e = State.cell[br];
+        if (a == null || b == null || d == null || e == null) continue;
+        const A = State.tiles[a], B = State.tiles[b], D = State.tiles[d], E = State.tiles[e];
+        const pid = A.picId;
+        if (B.picId !== pid || D.picId !== pid || E.picId !== pid) continue;
+        if (A.sub !== 0 || B.sub !== 1 || D.sub !== 2 || E.sub !== 3) continue;
+        return [tl, tr, bl, br];
+      }
+    }
+    return null;
+  }
+  function hasFloating() {
+    for (let col = 0; col < State.cols; col++) {
+      let seenEmpty = false;
+      for (let r = State.rows - 1; r >= 0; r--) {
+        const ti = State.cell[r * State.cols + col];
+        if (ti == null) seenEmpty = true;
+        else if (seenEmpty) return true;
+      }
+    }
+    return false;
+  }
+  function gravityResolveAfterMove() {
+    State.busy = true;
+    const cells = findCompletePicture();
+    if (cells) {
+      clearPicture(cells, () => {
+        applyColumnGravity(() => {
+          gravityResolveAfterMove();
+        });
+      });
+    } else if (hasFloating()) {
+      applyColumnGravity(() => {
+        gravityResolveAfterMove();
+      }, false);
+    } else {
+      State.busy = false;
+      if (isComplete()) {
+        onComplete();
+        return;
+      }
+      if (__reshuffleOn && !gravBoardSolvable()) {
+        reshuffleGravity();
+        return;
+      }
+      State.phase = "play";
+      drawBoard();
+    }
+  }
+  var __reshuffleOn = true;
+  var __reshuffleCount = 0;
+  function gravBoardSolvable() {
+    const subs = {};
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti = State.cell[ci];
+      if (ti == null) continue;
+      const t = State.tiles[ti];
+      (subs[t.picId] = subs[t.picId] || /* @__PURE__ */ new Set()).add(t.sub);
+    }
+    for (const pid in subs) if (subs[pid].size === 4) return true;
+    return false;
+  }
+  function gravCellHasComplete(cell, tiles) {
+    const cols = State.cols, rows = State.rows;
+    for (let r = 0; r < rows - 1; r++) for (let c = 0; c < cols - 1; c++) {
+      const tl = cell[r * cols + c], tr = cell[r * cols + c + 1], bl = cell[(r + 1) * cols + c], br = cell[(r + 1) * cols + c + 1];
+      if (tl == null || tr == null || bl == null || br == null) continue;
+      const A = tiles[tl], B = tiles[tr], D = tiles[bl], E = tiles[br];
+      if (A.picId === B.picId && A.picId === D.picId && A.picId === E.picId && A.sub === 0 && B.sub === 1 && D.sub === 2 && E.sub === 3) return true;
+    }
+    return false;
+  }
+  function reshuffleGravity(onDone) {
+    State.busy = true;
+    __reshuffleCount++;
+    const rnd = () => Math.random();
+    const shuffle = (a) => {
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = rnd() * (i + 1) | 0;
+        const t = a[i];
+        a[i] = a[j];
+        a[j] = t;
+      }
+      return a;
+    };
+    const picSet = /* @__PURE__ */ new Set();
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti = State.cell[ci];
+      if (ti != null) picSet.add(State.tiles[ti].picId);
+    }
+    for (let col = 0; col < State.cols; col++) for (const c of State.deck[col] || []) picSet.add(c.picId);
+    const pids = shuffle([...picSet]);
+    const boardPicN = Math.min(Math.floor(State.N / 4), pids.length);
+    const boardPids = pids.slice(0, boardPicN), deckPids = pids.slice(boardPicN);
+    let tiles = null, cell = null;
+    const cols = State.cols, rows = State.rows;
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const perm = [];
+      for (const pid of boardPids) for (let s = 0; s < 4; s++) perm.push({ picId: pid, sub: s });
+      shuffle(perm);
+      const T = perm.map((p, i) => ({ home: i, picId: p.picId, sub: p.sub, faceUp: false, reveal: 0, anim: null }));
+      const C = new Array(State.N).fill(null);
+      const per = Math.floor(perm.length / cols), extra = perm.length % cols;
+      let idx = 0;
+      for (let cc = 0; cc < cols; cc++) {
+        const cnt = per + (cc < extra ? 1 : 0);
+        for (let k = 0; k < cnt; k++) C[(rows - 1 - k) * cols + cc] = idx++;
+      }
+      if (!gravCellHasComplete(C, T)) {
+        tiles = T;
+        cell = C;
+        break;
+      }
+      if (attempt === 399) {
+        tiles = T;
+        cell = C;
+      }
+    }
+    State.tiles = tiles;
+    State.cell = cell;
+    State.deck = Array.from({ length: State.cols }, () => []);
+    for (const pid of shuffle([...deckPids])) {
+      const sc = shuffle([0, 1, 2, 3]);
+      for (let c = 0; c < State.cols; c++) State.deck[c].push({ picId: pid, sub: sc[c], tileIdx: -1 });
+    }
+    State.bondH = new Array(State.N).fill(0);
+    State.bondV = new Array(State.N).fill(0);
+    layout();
+    State.cardBack = buildCardBack(State.tileW, State.tileH);
+    invalidateStaticCache();
+    syncBondProgress();
+    drawBoard();
+    dealIn(() => {
+      reveal(() => {
+        State.phase = "play";
+        State.busy = false;
+        onDone && onDone();
+      });
+    });
+  }
+  function clearPicture(cells, onDone) {
+    State.clearedPics++;
+    {
+      const ti0 = State.cell[cells[0]];
+      const t0c = ti0 != null ? State.tiles[ti0] : null;
+      if (t0c) State.clearedList.push(t0c.picId);
+    }
+    haptic("medium");
+    SFX.play("snap");
+    SFX.play("complete", 0.5);
+    let gx = 0, gy = 0;
+    for (const c of cells) {
+      const p = cellXY(c);
+      gx += p.x + p.w / 2;
+      gy += p.y + p.h / 2;
+    }
+    const pivot = { x: gx / cells.length, y: gy / cells.length };
+    const t0 = now(), dur = GRAV.CLEAR_POP;
+    State.anims.push({
+      update(t) {
+        const k = clamp01((t - t0) / dur);
+        const s = 1 + Math.sin(Math.min(k, 0.5) * Math.PI) * 0.07;
+        const fade = 1 - clamp01((k - 0.45) / 0.55);
+        for (const c of cells) {
+          const ti = State.cell[c];
+          if (ti == null) continue;
+          const p = cellXY(c);
+          State.tiles[ti].anim = {
+            x: p.x,
+            y: p.y,
+            scale: s,
+            pivot,
+            shadow: false,
+            faceAlpha: fade,
+            backAlpha: 0,
+            edges: { l: cells.includes(c - 1) ? 1 : 0, r: cells.includes(c + 1) ? 1 : 0, t: cells.includes(c - State.cols) ? 1 : 0, b: cells.includes(c + State.cols) ? 1 : 0 }
+          };
+        }
+        State.fx = { cells, glow: Math.sin(Math.min(k, 0.5) * Math.PI), scale: s, pivot };
+        return k >= 1;
+      },
+      finish() {
+        for (const c of cells) {
+          const ti = State.cell[c];
+          if (ti != null) State.tiles[ti].anim = null;
+          State.cell[c] = null;
+        }
+        State.fx = null;
+        drawBoard();
+        onDone && onDone();
+      }
+    });
+    ensureLoop();
+  }
+  function nextDeckCard(col) {
+    if (State.deck[col] && State.deck[col].length) return State.deck[col].pop();
+    let best = -1, bestN = 0;
+    for (let c = 0; c < State.cols; c++) {
+      const n = (State.deck[c] || []).length;
+      if (n > bestN) {
+        bestN = n;
+        best = c;
+      }
+    }
+    return best >= 0 ? State.deck[best].pop() : null;
+  }
+  function applyColumnGravity(onDone, doFeed) {
+    if (doFeed === void 0) doFeed = true;
+    const cols = State.cols, rows = State.rows;
+    const moves = [];
+    const feeds = [];
+    for (let col = 0; col < cols; col++) {
+      const colTiles = [];
+      for (let r = 0; r < rows; r++) {
+        const ti = State.cell[r * cols + col];
+        if (ti != null) colTiles.push({ ti, fromRow: r });
+      }
+      const settledCount = colTiles.length;
+      const baseRow = rows - settledCount;
+      for (let i = 0; i < colTiles.length; i++) {
+        const toRow = baseRow + i;
+        if (colTiles[i].fromRow !== toRow) moves.push({ ti: colTiles[i].ti, fromRow: colTiles[i].fromRow, toRow, col });
+      }
+      if (doFeed) for (let fillRow = baseRow - 1; fillRow >= 0; fillRow--) {
+        const card = nextDeckCard(col);
+        if (!card) break;
+        feeds.push({ card, col, toRow: fillRow });
+      }
+    }
+    const newCell = new Array(State.N).fill(null);
+    for (let col = 0; col < cols; col++) {
+      const colTiles = [];
+      for (let r = 0; r < rows; r++) {
+        const ti = State.cell[r * cols + col];
+        if (ti != null) colTiles.push(ti);
+      }
+      const settledCount = colTiles.length;
+      const baseRow = rows - settledCount;
+      for (let i = 0; i < colTiles.length; i++) newCell[(baseRow + i) * cols + col] = colTiles[i];
+    }
+    for (const f of feeds) {
+      const ti = State.tiles.length;
+      State.tiles.push({ home: ti, picId: f.card.picId, sub: f.card.sub, faceUp: false, reveal: 0, anim: null });
+      f.tileIdx = ti;
+      newCell[f.toRow * cols + f.col] = ti;
+    }
+    State.cell = newCell;
+    syncBondProgress();
+    const t0 = now();
+    let pending = 0;
+    for (const m of moves) {
+      pending++;
+      const tile = State.tiles[m.ti];
+      const fromP = { x: cellXY(m.toRow * cols + m.col).x, y: cellXY(m.fromRow * cols + m.col).y };
+      const toP = cellXY(m.toRow * cols + m.col);
+      tile.anim = { x: fromP.x, y: fromP.y, scale: 1, shadow: false, edges: null, faceAlpha: tile.faceUp ? 1 : 0, backAlpha: tile.faceUp ? 0 : 1 };
+      State.anims.push({
+        update(t) {
+          const k = clamp01((t - t0) / GRAV.GRAVITY_DUR);
+          const e = k * k;
+          tile.anim.y = lerp(fromP.y, toP.y, e);
+          return k >= 1;
+        },
+        finish() {
+          tile.anim = null;
+          haptic("light");
+          if (--pending <= 0) settle();
+        }
+        // LAND: piece hit the floor / another piece (user req)
+      });
+    }
+    for (const f of feeds) {
+      pending++;
+      const tile = State.tiles[f.tileIdx];
+      const toP = cellXY(f.toRow * cols + f.col);
+      const fromY = (State.pad || 0) + Math.round((GRAV.DECK_ROWS - 1) * (State.tileH + State.gap));
+      tile.anim = { x: toP.x, y: fromY, scale: 1, scaleX: 1, shadow: false, edges: { l: 0, r: 0, t: 0, b: 0 }, backAlpha: 1, faceAlpha: 0 };
+      State.anims.push({
+        update(t) {
+          const k = clamp01((t - t0) / GRAV.FEED_DUR);
+          const e = k * k;
+          tile.anim.y = lerp(fromY, toP.y, e);
+          const fk = clamp01((k - 0.35) / 0.65);
+          const half = fk < 0.5;
+          tile.anim.scaleX = Math.abs(Math.cos(fk * Math.PI));
+          tile.anim.backAlpha = half ? 1 : 0;
+          tile.anim.faceAlpha = half ? 0 : 1;
+          tile.reveal = half ? 0 : 1;
+          if (k >= 1) {
+            tile.faceUp = true;
+            tile.reveal = 1;
+          }
+          return k >= 1;
+        },
+        finish() {
+          tile.anim = null;
+          tile.faceUp = true;
+          tile.reveal = 1;
+          haptic("selection");
+          if (--pending <= 0) settle();
+        }
+        // LAND: dealt-in deck card settles (user req)
+      });
+    }
+    function settle() {
+      syncBondProgress();
+      drawBoard();
+      onDone && onDone();
+    }
+    if (pending === 0) {
+      settle();
+      return;
+    }
+    ensureLoop();
+  }
+  function showBanner() {
+    overlay.style.display = "flex";
+    {
+      const hud = document.getElementById("hud-top");
+      if (hud) hud.style.opacity = "0";
+    }
+    if (!IS_GRAVITY) boardCanvas.classList.add("complete");
+    const t0 = now();
+    banner.style.transform = "translateY(-44px) scale(.7)";
+    banner.style.opacity = "0";
+    function step() {
+      const k = clamp01((now() - t0) / CFG.BANNER_DUR);
+      const e = easeOutBack(k);
+      banner.style.transform = "translateY(" + lerp(-44, 0, e) + "px) scale(" + (0.7 + 0.3 * e) + ")";
+      banner.style.opacity = String(clamp01(k * 2));
+      if (k < 1) requestAnimationFrame(step);
+      else {
+        showReward();
+        setTimeout(showNext, CFG.NEXT_DELAY);
+      }
+    }
+    requestAnimationFrame(step);
+  }
+  function showReward() {
+    if (STAGE_FLOW) {
+      const earned = coinsForLevel();
+      Wallet.coins += earned;
+      saveWallet();
+      rewardEl.lastChild.textContent = "+" + earned;
+      updateCoinHud();
+      showCoinHud(true);
+    }
+    placeReward();
+    setTimeout(placeReward, 500);
+    const t0 = now();
+    function step() {
+      const k = clamp01((now() - t0) / 260);
+      const e = easeOutBack(k);
+      rewardEl.style.transform = "translate(-50%,-100%) scale(" + (0.4 + 0.6 * e) + ")";
+      rewardEl.style.opacity = String(clamp01(k * 1.5));
+      if (k < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  function placeReward() {
+    if (!overlay || overlay.style.display === "none") return;
+    const sr = document.getElementById("stage").getBoundingClientRect();
+    if (!IS_GRAVITY && boardCanvas.classList.contains("complete")) {
+      const br = boardCanvas.getBoundingClientRect();
+      rewardEl.style.left = br.left + br.width / 2 - sr.left + "px";
+      rewardEl.style.top = br.bottom - sr.top + "px";
+    } else {
+      rewardEl.style.left = sr.width / 2 + "px";
+      rewardEl.style.top = sr.height * 0.8 + "px";
+    }
+  }
+  function showNext() {
+    const t0 = now();
+    function step() {
+      const k = clamp01((now() - t0) / 240);
+      const e = easeOutBack(k);
+      nextBtn.style.transform = "translateY(" + lerp(18, 0, e) + "px) scale(" + (0.9 + 0.1 * e) + ")";
+      nextBtn.style.opacity = String(k);
+      if (k < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  var montageRaf = 0;
+  var montageCards = [];
+  var montageT0 = 0;
+  var montageNextSpawn = 0;
+  var montageSeq = 0;
+  var MONTAGE_SPAWN_MS = 220;
+  var MONTAGE_LIFE = 900;
+  function sizeMontage() {
+    const overlayR = overlay.getBoundingClientRect();
+    if (!overlayR.width || !overlayR.height) return;
+    const bannerR = banner.getBoundingClientRect();
+    const bottomR = document.getElementById("result-bottom").getBoundingClientRect();
+    let top = (bannerR.bottom || overlayR.top) - overlayR.top + 10;
+    let bot = (bottomR.top || overlayR.bottom) - overlayR.top - 10;
+    if (!(bot > top)) {
+      top = overlayR.height * 0.16;
+      bot = overlayR.height * 0.82;
+    }
+    const cssW = overlayR.width, cssH = Math.max(40, bot - top);
+    montageCanvas.style.top = top + "px";
+    montageCanvas.style.height = cssH + "px";
+    montageCanvas.width = Math.round(cssW * DPR);
+    montageCanvas.height = Math.round(cssH * DPR);
+  }
+  function drawMontageCard(card) {
+    const cw = montageCanvas.width, ch = montageCanvas.height;
+    const cardW = cw * 0.22;
+    const cardW2 = cardW * card.scale, cardH2 = cardW2 * 1.5;
+    const rad = cardW2 * 0.12;
+    mctx.save();
+    mctx.globalAlpha = card.alpha;
+    mctx.translate(card.x, card.y);
+    mctx.rotate(card.rot);
+    mctx.shadowColor = "rgba(0,0,0,.45)";
+    mctx.shadowBlur = cardW2 * 0.18;
+    mctx.shadowOffsetY = cardW2 * 0.06;
+    const rim = cardW2 * 0.06;
+    mctx.fillStyle = "#ffffff";
+    rr(mctx, -cardW2 / 2 - rim, -cardH2 / 2 - rim, cardW2 + rim * 2, cardH2 + rim * 2, rad + rim);
+    mctx.fill();
+    mctx.shadowColor = "transparent";
+    mctx.shadowBlur = 0;
+    mctx.shadowOffsetY = 0;
+    rr(mctx, -cardW2 / 2, -cardH2 / 2, cardW2, cardH2, rad);
+    mctx.clip();
+    const img = State.picImg[card.pid];
+    if (img && img.width) {
+      const iw = img.width, ih = img.height, ir = iw / ih, cr = cardW2 / cardH2;
+      let sw, sh, sx, sy;
+      if (ir > cr) {
+        sh = ih;
+        sw = ih * cr;
+        sx = (iw - sw) / 2;
+        sy = 0;
+      } else {
+        sw = iw;
+        sh = iw / cr;
+        sx = 0;
+        sy = (ih - sh) / 2;
+      }
+      mctx.drawImage(img, sx, sy, sw, sh, -cardW2 / 2, -cardH2 / 2, cardW2, cardH2);
+    } else {
+      mctx.fillStyle = gravPicColor(card.pid);
+      mctx.fillRect(-cardW2 / 2, -cardH2 / 2, cardW2, cardH2);
+    }
+    mctx.restore();
+  }
+  function montageStep() {
+    const t = now();
+    const cw = montageCanvas.width, ch = montageCanvas.height;
+    mctx.clearRect(0, 0, cw, ch);
+    const pics = State.clearedList && State.clearedList.length ? State.clearedList : [0, 1, 2, 3];
+    while (t >= montageNextSpawn) {
+      const pid = pics[montageSeq % pics.length];
+      montageSeq++;
+      const cardW = cw * 0.22, cardH = cardW * 1.5;
+      const mx = cardW * 0.6, my = cardH * 0.5;
+      const gridW = cw * 0.96, gridH = Math.min(ch, cw * 0.92);
+      const gx = (cw - gridW) / 2, gy = (ch - gridH) / 2;
+      montageCards.push({
+        pid,
+        x: gx + mx + Math.random() * Math.max(1, gridW - mx * 2),
+        y: gy + my + Math.random() * Math.max(1, gridH - my * 2),
+        rot: (Math.random() - 0.5) * (Math.PI / 180) * 30,
+        // ±15°
+        scale: 0.86 + Math.random() * 0.34,
+        // slight size variety
+        born: t,
+        life: MONTAGE_LIFE,
+        alpha: 0
+      });
+      montageNextSpawn += MONTAGE_SPAWN_MS;
+      if (montageNextSpawn < t - MONTAGE_SPAWN_MS * 4) montageNextSpawn = t + MONTAGE_SPAWN_MS;
+    }
+    for (let i = montageCards.length - 1; i >= 0; i--) {
+      const c = montageCards[i];
+      const age = t - c.born, k = age / c.life;
+      if (k >= 1) {
+        montageCards.splice(i, 1);
+        continue;
+      }
+      const fadeIn = clamp01(age / 160);
+      const fadeOut = clamp01((c.life - age) / 320);
+      c.alpha = Math.min(fadeIn, fadeOut);
+    }
+    for (let i = 0; i < montageCards.length; i++) drawMontageCard(montageCards[i]);
+    montageRaf = requestAnimationFrame(montageStep);
+  }
+  function startMontage() {
+    if (!IS_GRAVITY) return;
+    stopMontage();
+    sizeMontage();
+    montageCards = [];
+    montageSeq = 0;
+    montageT0 = now();
+    montageNextSpawn = montageT0;
+    montageCanvas.style.display = "block";
+    montageRaf = requestAnimationFrame(montageStep);
+    setTimeout(() => {
+      if (montageRaf) sizeMontage();
+    }, 520);
+  }
+  function stopMontage() {
+    if (montageRaf) {
+      cancelAnimationFrame(montageRaf);
+      montageRaf = 0;
+    }
+    montageCards = [];
+    if (mctx) mctx.clearRect(0, 0, montageCanvas.width, montageCanvas.height);
+    montageCanvas.style.display = "none";
+  }
+  window.addEventListener("resize", () => {
+    if (montageRaf) sizeMontage();
+  });
+  var confettiActive = false;
+  var confettiParts = [];
+  var confettiT0 = 0;
+  var cctx = confettiCanvas.getContext("2d");
+  var CONFETTI_COLORS = ["#ff5d8f", "#ffd54a", "#5bd1ff", "#7cf29c", "#c084fc", "#ff8a3d", "#ffffff"];
+  function fireConfetti() {
+    confettiCanvas.style.display = "block";
+    confettiParts.length = 0;
+    const cw = confettiCanvas.width, ch = confettiCanvas.height;
+    const COL = () => CONFETTI_COLORS[Math.random() * CONFETTI_COLORS.length | 0];
+    const ox = cw / 2, oy = ch * 0.42;
+    for (let i = 0; i < CFG.CONFETTI_N; i++) {
+      const ang = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 1.2;
+      const spd = (3 + Math.random() * 7) * DPR;
+      confettiParts.push({
+        x: ox + (Math.random() - 0.5) * 60 * DPR,
+        y: oy,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd - 4 * DPR,
+        g: 0.22 * DPR,
+        w: (5 + Math.random() * 7) * DPR,
+        h: (7 + Math.random() * 9) * DPR,
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 0.4,
+        c: COL(),
+        sway: 0,
+        swayAmp: 0
+      });
+    }
+    const rainN = Math.round(CFG.CONFETTI_N * 2.2);
+    for (let i = 0; i < rainN; i++) {
+      confettiParts.push({
+        x: Math.random() * cw,
+        y: -Math.random() * ch * 0.45,
+        // staggered entry from just above the top
+        vx: (Math.random() - 0.5) * 1 * DPR,
+        vy: (4 + Math.random() * 5) * DPR,
+        g: 0.12 * DPR,
+        w: (5 + Math.random() * 7) * DPR,
+        h: (8 + Math.random() * 10) * DPR,
+        rot: Math.random() * Math.PI * 2,
+        vr: (Math.random() - 0.5) * 0.3,
+        c: COL(),
+        sway: Math.random() * Math.PI * 2,
+        swayAmp: (1 + Math.random() * 2) * DPR
+        // gentle side-to-side flutter
+      });
+    }
+    confettiActive = true;
+    confettiT0 = now();
+    ensureLoop();
+  }
+  function stepConfetti(t) {
+    const cw = confettiCanvas.width, ch = confettiCanvas.height;
+    cctx.clearRect(0, 0, cw, ch);
+    const age = t - confettiT0;
+    const fade = clamp01(1 - (age - CFG.CONFETTI_MS * 0.78) / (CFG.CONFETTI_MS * 0.22));
+    const term = 14 * DPR;
+    for (const p of confettiParts) {
+      p.vy += p.g;
+      if (p.vy > term) p.vy = term;
+      p.sway += 0.08;
+      p.x += p.vx + Math.sin(p.sway) * (p.swayAmp || 0);
+      p.y += p.vy;
+      p.rot += p.vr;
+      cctx.save();
+      cctx.translate(p.x, p.y);
+      cctx.rotate(p.rot);
+      cctx.globalAlpha = fade;
+      cctx.fillStyle = p.c;
+      cctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      cctx.restore();
+    }
+    if (age > CFG.CONFETTI_MS) {
+      confettiActive = false;
+      confettiParts.length = 0;
+      cctx.clearRect(0, 0, cw, ch);
+      confettiCanvas.style.display = "none";
+    }
+  }
+  function cellAtPoint(localX, localY) {
+    for (let ci = 0; ci < State.N; ci++) {
+      const p = cellXY(ci);
+      if (localX >= p.x && localX <= p.x + p.w && localY >= p.y && localY <= p.y + p.h) return ci;
+    }
+    return -1;
+  }
+  function toLocal(clientX, clientY) {
+    const r = boardCanvas.getBoundingClientRect();
+    return {
+      x: (clientX - r.left) * (boardCanvas.width / r.width),
+      y: (clientY - r.top) * (boardCanvas.height / r.height)
+    };
+  }
+  var lastHover = -1;
+  function renderDragCanvas() {
+    const d = State.dragging;
+    const group = d.group;
+    let minCol = Infinity, minRow = Infinity, maxCol = -Infinity, maxRow = -Infinity;
+    for (const ci of group) {
+      const c = ci % State.cols, r = ci / State.cols | 0;
+      if (c < minCol) minCol = c;
+      if (c > maxCol) maxCol = c;
+      if (r < minRow) minRow = r;
+      if (r > maxRow) maxRow = r;
+    }
+    const anchor = cellXY(minRow * State.cols + minCol);
+    const farCell = cellXY(maxRow * State.cols + maxCol);
+    const bw = farCell.x + farCell.w - anchor.x;
+    const bh = farCell.y + farCell.h - anchor.y;
+    const pad = 24 * DPR;
+    const sc = CFG.PICK_SCALE;
+    const cw = bw * sc + pad * 2, ch = bh * sc + pad * 2;
+    dragCanvas.width = Math.round(cw);
+    dragCanvas.height = Math.round(ch);
+    dragCanvas.style.width = cw / DPR + "px";
+    dragCanvas.style.height = ch / DPR + "px";
+    dctx.clearRect(0, 0, cw, ch);
+    dctx.save();
+    dctx.translate(pad + bw * (sc - 1) / 2, pad + bh * (sc - 1) / 2);
+    const groupSet = new Set(group);
+    for (const ci of group) {
+      const ti = State.cell[ci];
+      const p = cellXY(ci);
+      const lx = p.x - anchor.x, ly = p.y - anchor.y;
+      const c = ci % State.cols, r = ci / State.cols | 0;
+      const E = {
+        l: c > 0 && groupSet.has(ci - 1) ? 1 : 0,
+        r: c < State.cols - 1 && groupSet.has(ci + 1) ? 1 : 0,
+        t: r > 0 && groupSet.has(ci - State.cols) ? 1 : 0,
+        b: r < State.rows - 1 && groupSet.has(ci + State.cols) ? 1 : 0
+      };
+      drawTile(dctx, ti, lx, ly, { w: p.w, h: p.h, scale: sc, shadow: group.length === 1, edges: E });
+    }
+    dctx.restore();
+    d.padPx = pad;
+    d.bbox = { minCol, minRow, anchorX: anchor.x, anchorY: anchor.y, bw, bh };
+  }
+  function moveDragCanvas(clientX, clientY) {
+    const d = State.dragging;
+    const wrapR = document.getElementById("board-wrap").getBoundingClientRect();
+    const pad = d.padPx / DPR;
+    const sc = CFG.PICK_SCALE;
+    const gp = cellXY(d.originCell);
+    const offCSSx = (gp.x - d.bbox.anchorX) / DPR;
+    const offCSSy = (gp.y - d.bbox.anchorY) / DPR;
+    const cssTileW = gp.w / DPR, cssTileH = gp.h / DPR;
+    const recX = d.bbox.bw * (sc - 1) / 2 / DPR, recY = d.bbox.bh * (sc - 1) / 2 / DPR;
+    const cx = clientX - d.grabDX;
+    const cy = clientY - d.grabDY;
+    const bcr = boardCanvas.getBoundingClientRect();
+    const z = bcr.width / (parseFloat(boardCanvas.style.width) || bcr.width);
+    const tlx = (cx - wrapR.left) / z - pad - recX - offCSSx * sc - cssTileW * sc / 2;
+    const tly = (cy - wrapR.top) / z - pad - recY - offCSSy * sc - cssTileH * sc / 2;
+    dragCanvas.style.transform = `translate(${tlx}px, ${tly}px)`;
+  }
+  var activePointer = null;
+  function onPointerDown(e) {
+    if (State.busy && rafId === 0 && State.anims.length === 0) recoverFromStuck();
+    if (State.phase !== "play" || State.busy) return;
+    const pt = e.touches ? e.touches[0] : e;
+    const loc = toLocal(pt.clientX, pt.clientY);
+    const ci = cellAtPoint(loc.x, loc.y);
+    if (ci < 0) return;
+    const ti = State.cell[ci];
+    if (ti == null) return;
+    e.preventDefault();
+    activePointer = pt.pointerId != null ? pt.pointerId : 0;
+    const group = groupCellsOf(ci);
+    const groupSet = new Set(group);
+    State.dragging = { originCell: ci, group, groupSet };
+    for (const gc of group) {
+      const t = State.tiles[State.cell[gc]];
+      if (t) t.anim = null;
+    }
+    const wrapR = document.getElementById("board-wrap").getBoundingClientRect();
+    const boardR = boardCanvas.getBoundingClientRect();
+    const p = cellXY(ci);
+    const tileCenterCSSx = boardR.left + (p.x + p.w / 2) * (boardR.width / boardCanvas.width);
+    const tileCenterCSSy = boardR.top + (p.y + p.h / 2) * (boardR.height / boardCanvas.height);
+    State.dragging.grabDX = pt.clientX - tileCenterCSSx;
+    State.dragging.grabDY = pt.clientY - tileCenterCSSy;
+    lastHover = ci;
+    renderDragCanvas();
+    dragCanvas.style.display = "block";
+    moveDragCanvas(pt.clientX, pt.clientY);
+    drawBoard();
+    haptic("selection");
+    SFX.resume();
+    SFX.play("pick", 0.55);
+  }
+  function onPointerMove(e) {
+    if (!State.dragging) return;
+    const pt = e.touches ? e.touches[0] : e;
+    e.preventDefault();
+    moveDragCanvas(pt.clientX, pt.clientY);
+    const loc = toLocal(pt.clientX, pt.clientY);
+    const ci = cellAtPoint(loc.x, loc.y);
+    if (ci !== lastHover) {
+      lastHover = ci;
+    }
+  }
+  function onPointerUp(e) {
+    if (!State.dragging) return;
+    const pt = e.changedTouches ? e.changedTouches[0] : e;
+    e.preventDefault();
+    const loc = toLocal(pt.clientX, pt.clientY);
+    let target = cellAtPoint(loc.x, loc.y);
+    const d = State.dragging;
+    const originCell = d.originCell;
+    const op = cellXY(originCell);
+    const cx = pt.clientX - d.grabDX, cy = pt.clientY - d.grabDY;
+    const boardR = boardCanvas.getBoundingClientRect();
+    const liftDX = (cx - boardR.left) * (boardCanvas.width / boardR.width) - op.w / 2 - op.x;
+    const liftDY = (cy - boardR.top) * (boardCanvas.height / boardR.height) - op.h / 2 - op.y;
+    dragCanvas.style.display = "none";
+    State.dragging = null;
+    if (target < 0) {
+      State.phase = "swapping";
+      returnGroup(d.group, liftDX, liftDY, () => {
+        drawBoard();
+      });
+    } else {
+      resolveMove(originCell, target, liftDX, liftDY);
+    }
+  }
+  boardCanvas.addEventListener("pointerdown", onPointerDown, { passive: false });
+  window.addEventListener("pointermove", onPointerMove, { passive: false });
+  window.addEventListener("pointerup", onPointerUp, { passive: false });
+  window.addEventListener("pointercancel", onPointerUp, { passive: false });
+  function levelDef(level) {
+    const L = Math.max(1, Math.min(MAX_LEVEL, level | 0));
+    const e = LEVELS[L];
+    const cols = e && e.cols || 4, rows = e && e.rows || 4;
+    return { cols, rows, seed: L * 2654435761 + 12345 >>> 0, image: L - 1 };
+  }
+  function makeScramble(seed) {
+    const r = rng(seed);
+    const cols = State.cols, rows = State.rows, N = State.N;
+    function initialBonds(p) {
+      let n = 0;
+      for (let ci = 0; ci < N; ci++) {
+        const col = ci % cols, row = ci / cols | 0, a = p[ci];
+        if (col < cols - 1) {
+          const b = p[ci + 1];
+          if (homeRowOf(b) === homeRowOf(a) && homeColOf(b) === homeColOf(a) + 1) n++;
+        }
+        if (row < rows - 1) {
+          const b = p[ci + cols];
+          if (homeColOf(b) === homeColOf(a) && homeRowOf(b) === homeRowOf(a) + 1) n++;
+        }
+      }
+      return n;
+    }
+    let perm, best = null, bestBonds = Infinity;
+    for (let attempt = 0; attempt < 400; attempt++) {
+      perm = Array.from({ length: N }, (_, i) => i);
+      for (let i = perm.length - 1; i > 0; i--) {
+        const j = r() * (i + 1) | 0;
+        [perm[i], perm[j]] = [perm[j], perm[i]];
+      }
+      if (perm.every((v, i) => v === i)) continue;
+      const bonds = initialBonds(perm);
+      if (bonds === 0) return perm;
+      if (bonds < bestBonds) {
+        bestBonds = bonds;
+        best = perm.slice();
+      }
+    }
+    return best || perm;
+  }
+  function setupGravity(level) {
+    var _a, _b;
+    State.level = level;
+    State.cols = GRAV.COLS;
+    State.rows = GRAV.PLAY_ROWS;
+    State.N = State.cols * State.rows;
+    State.seed = level * 2654435761 + 999 >>> 0;
+    State.gridConverge = 0;
+    State.fx = null;
+    State.anims.length = 0;
+    State.dragging = null;
+    State.phase = "boot";
+    State.busy = false;
+    State.hints = STAGE_FLOW ? Wallet.hints : CFG.HINTS;
+    updateHintBadge();
+    if (btnHintEl) btnHintEl.style.visibility = "visible";
+    showCoinHud(false);
+    levelNumEl.textContent = String(level);
+    overlay.style.display = "none";
+    {
+      const hud = document.getElementById("hud-top");
+      if (hud) hud.style.opacity = "1";
+    }
+    boardCanvas.classList.remove("complete");
+    banner.style.transform = "translateY(-44px) scale(.7)";
+    banner.style.opacity = "0";
+    rewardEl.style.transform = "translate(-50%,-100%) scale(.4)";
+    rewardEl.style.opacity = "0";
+    nextBtn.style.transform = "translateY(18px) scale(.9)";
+    nextBtn.style.opacity = "0";
+    if (praiseRaf) {
+      cancelAnimationFrame(praiseRaf);
+      praiseRaf = 0;
+    }
+    praiseEl.style.opacity = "0";
+    const r = rng(State.seed);
+    const playPics = GRAV.PLAY_PICS, deckPics = (_a = levelEntry(level).deckPics) != null ? _a : GRAV.DECK_PICS;
+    State.totalPics = playPics + deckPics;
+    State.clearedPics = 0;
+    State.clearedList = [];
+    stopMontage();
+    State.picImg = [];
+    State.picSrcIdx = [];
+    if (STAGE_FLOW) {
+      const start = (_b = levelEntry(level).poolStart) != null ? _b : 0;
+      for (let pid = 0; pid < State.totalPics; pid++) {
+        const srcIdx = (start + pid) % GRAV_POOL.length;
+        State.picSrcIdx[pid] = srcIdx;
+        State.picImg[pid] = gravPoolImages[srcIdx] || null;
+        if (!gravPoolImages[srcIdx]) {
+          const im = new Image(), cap = srcIdx;
+          im.decoding = "async";
+          im.onload = () => {
+            gravPoolImages[cap] = im;
+            let touched = false;
+            for (let q = 0; q < State.picSrcIdx.length; q++) {
+              if (State.picSrcIdx[q] === cap && !State.picImg[q]) {
+                State.picImg[q] = im;
+                touched = true;
+              }
+            }
+            if (touched) drawBoard();
+          };
+          im.onerror = () => {
+          };
+          im.src = GRAV_POOL[srcIdx];
+        }
+      }
+    } else {
+      const nSrc = PUZZLE_SRCS.length;
+      const srcOrder = Array.from({ length: nSrc }, (_, i) => i);
+      for (let i = srcOrder.length - 1; i > 0; i--) {
+        const j = r() * (i + 1) | 0;
+        [srcOrder[i], srcOrder[j]] = [srcOrder[j], srcOrder[i]];
+      }
+      for (let pid = 0; pid < State.totalPics; pid++) {
+        const srcIdx = srcOrder[pid % nSrc];
+        State.picSrcIdx[pid] = srcIdx;
+        State.picImg[pid] = puzzleImages[srcIdx] || null;
+      }
+    }
+    State.tiles = [];
+    const playTiles = [];
+    for (let pid = 0; pid < playPics; pid++) for (let s = 0; s < 4; s++) playTiles.push({ picId: pid, sub: s });
+    let placement = null;
+    for (let attempt = 0; attempt < 600; attempt++) {
+      const perm = playTiles.slice();
+      for (let i = perm.length - 1; i > 0; i--) {
+        const j = r() * (i + 1) | 0;
+        [perm[i], perm[j]] = [perm[j], perm[i]];
+      }
+      const trialTiles = perm.map((p, i) => ({ home: i, picId: p.picId, sub: p.sub, faceUp: false, reveal: 0, anim: null }));
+      if (!gravHasCompletePicture(trialTiles)) {
+        placement = trialTiles;
+        break;
+      }
+      if (attempt === 599) placement = trialTiles;
+    }
+    State.tiles = placement;
+    State.cell = placement.map((_, i) => i);
+    State.deck = Array.from({ length: State.cols }, () => []);
+    const deckPids = [];
+    for (let pid = playPics; pid < State.totalPics; pid++) deckPids.push(pid);
+    for (let i = deckPids.length - 1; i > 0; i--) {
+      const j = r() * (i + 1) | 0;
+      [deckPids[i], deckPids[j]] = [deckPids[j], deckPids[i]];
+    }
+    for (const pid of deckPids) {
+      const subCol = [0, 1, 2, 3];
+      for (let i = subCol.length - 1; i > 0; i--) {
+        const j = r() * (i + 1) | 0;
+        [subCol[i], subCol[j]] = [subCol[j], subCol[i]];
+      }
+      for (let c = 0; c < State.cols; c++) State.deck[c].push({ picId: pid, sub: subCol[c], tileIdx: -1 });
+    }
+    State.bondH = new Array(State.N).fill(0);
+    State.bondV = new Array(State.N).fill(0);
+    layout();
+    State.cardBack = buildCardBack(State.tileW, State.tileH);
+    invalidateStaticCache();
+    syncBondProgress();
+    drawBoard();
+    dealIn(() => {
+      reveal(() => {
+        State.phase = "play";
+      });
+    });
+  }
+  function gravHasCompletePicture(tiles) {
+    const cols = State.cols, rows = State.rows;
+    for (let row = 0; row < rows - 1; row++) for (let c = 0; c < cols - 1; c++) {
+      const tl = row * cols + c, tr = tl + 1, bl = tl + cols, br = bl + 1;
+      const A = tiles[tl], B = tiles[tr], D = tiles[bl], E = tiles[br];
+      if (!A || !B || !D || !E) continue;
+      if (A.picId === B.picId && A.picId === D.picId && A.picId === E.picId && A.sub === 0 && B.sub === 1 && D.sub === 2 && E.sub === 3) return true;
+    }
+    return false;
+  }
+  function setupLevel(level) {
+    if (IS_GRAVITY) {
+      setupGravity(level);
+      return;
+    }
+    stopMontage();
+    const def = levelDef(level);
+    State.level = level;
+    State.cols = def.cols;
+    State.rows = def.rows;
+    State.N = def.cols * def.rows;
+    State.seed = def.seed;
+    State.gridConverge = 0;
+    State.fx = null;
+    State.anims.length = 0;
+    State.dragging = null;
+    State.phase = "boot";
+    State.hints = STAGE_FLOW ? Wallet.hints : CFG.HINTS;
+    updateHintBadge();
+    if (STAGE_FLOW && btnHintEl) btnHintEl.style.visibility = "visible";
+    showCoinHud(false);
+    levelNumEl.textContent = String(level);
+    overlay.style.display = "none";
+    {
+      const hud = document.getElementById("hud-top");
+      if (hud) hud.style.opacity = "1";
+    }
+    boardCanvas.style.transition = "none";
+    boardCanvas.classList.remove("complete");
+    void boardCanvas.offsetWidth;
+    requestAnimationFrame(() => {
+      boardCanvas.style.transition = "";
+    });
+    banner.style.transform = "translateY(-44px) scale(.7)";
+    banner.style.opacity = "0";
+    rewardEl.style.transform = "translate(-50%,-100%) scale(.4)";
+    rewardEl.style.opacity = "0";
+    nextBtn.style.transform = "translateY(18px) scale(.9)";
+    nextBtn.style.opacity = "0";
+    if (praiseRaf) {
+      cancelAnimationFrame(praiseRaf);
+      praiseRaf = 0;
+    }
+    praiseEl.style.opacity = "0";
+    if (STAGE_FLOW) {
+      const pIdx = singlePhotoIdx(level);
+      State.puzzleImg = singleCache[pIdx] || buildPuzzleImage(def.image);
+      if (!singleCache[pIdx]) {
+        const im = new Image();
+        im.decoding = "async";
+        im.onload = () => {
+          singleCache[pIdx] = im;
+          if (State.level === level && !IS_GRAVITY) {
+            State.puzzleImg = im;
+            drawBoard();
+          }
+        };
+        im.onerror = () => {
+        };
+        im.src = SINGLE_SRCS[pIdx];
+      }
+    } else {
+      const imgIdx = imageIndexForLevel(level);
+      State.puzzleImg = puzzleImages[imgIdx] || buildPuzzleImage(def.image);
+    }
+    State.tiles = Array.from({ length: State.N }, (_, ti) => ({ home: ti, faceUp: false, reveal: 0, anim: null }));
+    const perm = makeScramble(def.seed);
+    State.cell = perm.slice();
+    State.bondH = new Array(State.N).fill(0);
+    State.bondV = new Array(State.N).fill(0);
+    syncBondProgress();
+    layout();
+    State.cardBack = buildCardBack(State.tileW, State.tileH);
+    invalidateStaticCache();
+    drawBoard();
+    dealIn(() => {
+      reveal(() => {
+        State.phase = "play";
+        tutMaybeStart();
+      });
+    });
+  }
+  var currentLevel = STAGE_FLOW ? STAGE : RT.from || 1;
+  var __lastVW = window.innerWidth;
+  var __lastVH = window.innerHeight;
+  window.addEventListener("resize", () => {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    if (vw === __lastVW && Math.abs(vh - __lastVH) < 120) return;
+    __lastVW = vw;
+    __lastVH = vh;
+    layout();
+    if (State.tileW) State.cardBack = buildCardBack(State.tileW, State.tileH);
+    invalidateStaticCache();
+    drawBoard();
+    placeReward();
+  });
+  nextBtn.addEventListener("click", () => {
+    stopMontage();
+    if (STAGE_FLOW) {
+      location.search = "?stage=" + (STAGE + 1 > MAX_LEVEL ? 1 : STAGE + 1);
+      return;
+    }
+    currentLevel += 1;
+    setupLevel(currentLevel);
+    if (GR.active) {
+      GR.gameStart();
+      try {
+        GR.gameState(grSnapshot());
+      } catch (e) {
+      }
+    }
+  });
+  function updateHintBadge() {
+    if (!hintBadgeEl) return;
+    if (STAGE_FLOW && !IS_GRAVITY && State.hints <= 0) {
+      hintBadgeEl.textContent = "";
+      hintBadgeEl.classList.add("plus");
+      hintBadgeEl.style.display = "";
+      if (btnHintEl) btnHintEl.style.opacity = "1";
+      return;
+    }
+    hintBadgeEl.classList.remove("plus");
+    hintBadgeEl.textContent = String(State.hints);
+    hintBadgeEl.style.display = State.hints > 0 ? "" : "none";
+    if (btnHintEl) btnHintEl.style.opacity = State.hints > 0 ? "1" : "0.45";
+  }
+  function gravityHintMove() {
+    const cols = State.cols, rows = State.rows, N = State.N;
+    const single = (c) => c >= 0 && c < N && State.cell[c] != null && groupCellsOf(c).length === 1;
+    const emptyOrSingle = (c) => c >= 0 && c < N && (State.cell[c] == null || groupCellsOf(c).length === 1);
+    const findSub = (picId, sub, exclude) => {
+      for (let c = 0; c < N; c++) {
+        if (c === exclude) continue;
+        const t = State.cell[c];
+        if (t != null && single(c) && State.tiles[t].picId === picId && State.tiles[t].sub === sub) return c;
+      }
+      return -1;
+    };
+    for (let cb = 0; cb < N; cb++) {
+      const tb = State.cell[cb];
+      if (tb == null) continue;
+      const B = State.tiles[tb], col = cb % cols, row = cb / cols | 0;
+      if (col < cols - 1 && (B.sub === 0 || B.sub === 2)) {
+        const target = cb + 1, rt = State.cell[target];
+        const already = rt != null && State.tiles[rt].picId === B.picId && State.tiles[rt].sub === B.sub + 1;
+        if (!already && emptyOrSingle(target)) {
+          const src = findSub(B.picId, B.sub + 1, target);
+          if (src >= 0 && src !== cb) return { src, target };
+        }
+      }
+      if (row < rows - 1 && (B.sub === 0 || B.sub === 1)) {
+        const target = cb + cols, bt = State.cell[target];
+        const already = bt != null && State.tiles[bt].picId === B.picId && State.tiles[bt].sub === B.sub + 2;
+        if (!already && emptyOrSingle(target)) {
+          const src = findSub(B.picId, B.sub + 2, target);
+          if (src >= 0 && src !== cb) return { src, target };
+        }
+      }
+    }
+    return null;
+  }
+  function useHint() {
+    if (State.phase !== "play" || State.hints <= 0 || State.busy) return;
+    if (IS_GRAVITY) {
+      const mv = gravityHintMove();
+      if (!mv) return;
+      State.hints--;
+      if (STAGE_FLOW) {
+        Wallet.hints = State.hints;
+        saveWallet();
+      }
+      updateHintBadge();
+      haptic("selection");
+      SFX.resume();
+      resolveMove(mv.src, mv.target);
+      return;
+    }
+    let pick = -1, best = -1;
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti2 = State.cell[ci];
+      if (ti2 == null || State.tiles[ti2].home === ci) continue;
+      if (groupCellsOf(ci).length !== 1) continue;
+      const home2 = State.tiles[ti2].home, hc = home2 % State.cols, hr = home2 / State.cols | 0;
+      let pot = 0;
+      if (hc > 0 && State.cell[home2 - 1] === home2 - 1) pot++;
+      if (hc < State.cols - 1 && State.cell[home2 + 1] === home2 + 1) pot++;
+      if (hr > 0 && State.cell[home2 - State.cols] === home2 - State.cols) pot++;
+      if (hr < State.rows - 1 && State.cell[home2 + State.cols] === home2 + State.cols) pot++;
+      if (pot > best) {
+        best = pot;
+        pick = ci;
+      }
+    }
+    if (pick < 0) {
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti2 = State.cell[ci];
+        if (ti2 != null && State.tiles[ti2].home !== ci) {
+          pick = ci;
+          break;
+        }
+      }
+    }
+    if (pick < 0) return;
+    const ti = State.cell[pick], home = State.tiles[ti].home;
+    State.hints--;
+    if (STAGE_FLOW) {
+      Wallet.hints = State.hints;
+      saveWallet();
+    }
+    updateHintBadge();
+    haptic("selection");
+    SFX.resume();
+    resolveMove(pick, home);
+  }
+  var TUT = { active: false, step: 0, timer: 0, geomRaf: 0, src: -1, home: -1 };
+  var tutEl = {
+    root: document.getElementById("pp-tut"),
+    ring: document.getElementById("pp-tut-ring"),
+    hand: document.getElementById("pp-tut-hand"),
+    text: document.getElementById("pp-tut-text")
+  };
+  function tutPickMove() {
+    let pick = -1, best = -1;
+    for (let ci = 0; ci < State.N; ci++) {
+      const ti = State.cell[ci];
+      if (ti == null || State.tiles[ti].home === ci) continue;
+      if (groupCellsOf(ci).length !== 1) continue;
+      const home = State.tiles[ti].home, hc = home % State.cols, hr = home / State.cols | 0;
+      let pot = 0;
+      if (hc > 0 && State.cell[home - 1] === home - 1) pot++;
+      if (hc < State.cols - 1 && State.cell[home + 1] === home + 1) pot++;
+      if (hr > 0 && State.cell[home - State.cols] === home - State.cols) pot++;
+      if (hr < State.rows - 1 && State.cell[home + State.cols] === home + State.cols) pot++;
+      if (pot > best) {
+        best = pot;
+        pick = ci;
+      }
+    }
+    if (pick < 0) {
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti != null && State.tiles[ti].home !== ci) {
+          pick = ci;
+          break;
+        }
+      }
+    }
+    if (pick < 0) return null;
+    return { src: pick, home: State.tiles[State.cell[pick]].home };
+  }
+  function tutCellRectCSS(ci) {
+    const stageR = document.getElementById("stage").getBoundingClientRect();
+    const br = boardCanvas.getBoundingClientRect();
+    const sx = br.width / boardCanvas.width, sy = br.height / boardCanvas.height;
+    const p = cellXY(ci);
+    return { x: br.left - stageR.left + p.x * sx, y: br.top - stageR.top + p.y * sy, w: p.w * sx, h: p.h * sy };
+  }
+  function tutPlaceGuide() {
+    if (TUT.src < 0 || TUT.home < 0) return;
+    const a = tutCellRectCSS(TUT.src), b = tutCellRectCSS(TUT.home);
+    tutEl.ring.style.left = a.x + "px";
+    tutEl.ring.style.top = a.y + "px";
+    tutEl.ring.style.width = a.w + "px";
+    tutEl.ring.style.height = a.h + "px";
+    const x0 = a.x + a.w / 2, y0 = a.y + a.h / 2, x1 = b.x + b.w / 2, y1 = b.y + b.h / 2;
+    tutEl.hand.style.setProperty("--x0", x0 + "px");
+    tutEl.hand.style.setProperty("--y0", y0 + "px");
+    tutEl.hand.style.setProperty("--x1", x1 + "px");
+    tutEl.hand.style.setProperty("--y1", y1 + "px");
+  }
+  function tutGeomLoop() {
+    if (!TUT.active || TUT.step !== 2) {
+      TUT.geomRaf = 0;
+      return;
+    }
+    tutPlaceGuide();
+    TUT.geomRaf = requestAnimationFrame(tutGeomLoop);
+  }
+  function tutSetText(msg, centered) {
+    tutEl.text.textContent = msg;
+    tutEl.text.classList.toggle("center", !!centered);
+    tutEl.text.classList.add("show");
+  }
+  function tutClearTimer() {
+    if (TUT.timer) {
+      clearTimeout(TUT.timer);
+      TUT.timer = 0;
+    }
+  }
+  function tutMaybeStart() {
+    if (TUT.active) return;
+    if (!(State.level === 1 && !IS_GRAVITY && lsGet("pp_tut_s1") !== "1")) return;
+    TUT.active = true;
+    TUT.step = 1;
+    tutEl.root.classList.add("on");
+    tutSetText("Complete the picture!", true);
+    tutClearTimer();
+    TUT.timer = setTimeout(tutStepB, 1500);
+  }
+  function tutStepB() {
+    if (!TUT.active) return;
+    const mv = tutPickMove();
+    if (!mv) {
+      tutFinishSeen();
+      return;
+    }
+    TUT.step = 2;
+    TUT.src = mv.src;
+    TUT.home = mv.home;
+    tutEl.text.classList.remove("center");
+    tutSetText("Drag the piece into place \u{1F446}", false);
+    tutPlaceGuide();
+    tutEl.ring.classList.add("show");
+    tutEl.hand.classList.add("show");
+    if (!TUT.geomRaf) TUT.geomRaf = requestAnimationFrame(tutGeomLoop);
+  }
+  function tutOnMove() {
+    if (!TUT.active || TUT.step !== 2) return;
+    TUT.step = 3;
+    tutEl.ring.classList.remove("show");
+    tutEl.hand.classList.remove("show");
+    if (TUT.geomRaf) {
+      cancelAnimationFrame(TUT.geomRaf);
+      TUT.geomRaf = 0;
+    }
+    tutSetText("Nice! Matching pieces snap together \u2728  Now finish it yourself!", true);
+    tutClearTimer();
+    TUT.timer = setTimeout(tutFinishSeen, 2200);
+  }
+  function tutFinishSeen() {
+    tutClearTimer();
+    if (TUT.geomRaf) {
+      cancelAnimationFrame(TUT.geomRaf);
+      TUT.geomRaf = 0;
+    }
+    TUT.active = false;
+    TUT.step = 0;
+    TUT.src = -1;
+    TUT.home = -1;
+    tutEl.root.classList.remove("on");
+    tutEl.text.classList.remove("show", "center");
+    tutEl.ring.classList.remove("show");
+    tutEl.hand.classList.remove("show");
+    lsSet("pp_tut_s1", "1");
+  }
+  btnHintEl.addEventListener("click", () => {
+    if (STAGE_FLOW && !IS_GRAVITY && State.hints <= 0) {
+      openHintShop();
+      return;
+    }
+    useHint();
+  });
+  var HINT_PRICE = 900;
+  var HINT_PACK = 3;
+  var shopOpen = false;
+  function openHintShop() {
+    if (!hintShopEl) return;
+    shopOpen = true;
+    hintShopEl.classList.add("open");
+    updateCoinHud();
+    showCoinHud(true);
+  }
+  function closeHintShop() {
+    if (!hintShopEl) return;
+    shopOpen = false;
+    hintShopEl.classList.remove("open");
+    if (State.phase !== "complete") showCoinHud(false);
+  }
+  function buyHints() {
+    if (Wallet.coins < HINT_PRICE) {
+      shopBuyEl.classList.remove("shake");
+      void shopBuyEl.offsetWidth;
+      shopBuyEl.classList.add("shake");
+      haptic("selection");
+      return false;
+    }
+    Wallet.coins -= HINT_PRICE;
+    Wallet.hints += HINT_PACK;
+    State.hints = Wallet.hints;
+    saveWallet();
+    haptic("light");
+    try {
+      SFX.play("complete", 0.6);
+    } catch (e) {
+    }
+    updateHintBadge();
+    updateCoinHud();
+    closeHintShop();
+    return true;
+  }
+  if (shopBuyEl) shopBuyEl.addEventListener("click", buyHints);
+  if (shopCloseEl) shopCloseEl.addEventListener("click", closeHintShop);
+  if (hintShopEl) hintShopEl.addEventListener("click", (e) => {
+    if (e.target === hintShopEl) closeHintShop();
+  });
+  var CHEAT_KEY = "pp_cheat";
+  var CHEAT = STAGE_FLOW && lsGet(CHEAT_KEY) === "1";
+  var levelLabelEl = document.getElementById("level-label");
+  var cheatPrevEl = document.getElementById("cheat-prev");
+  var cheatNextEl = document.getElementById("cheat-next");
+  var cheatToastEl = document.getElementById("cheat-toast");
+  function applyCheatUI() {
+    if (cheatPrevEl) cheatPrevEl.classList.toggle("on", CHEAT && STAGE > 1);
+    if (cheatNextEl) cheatNextEl.classList.toggle("on", CHEAT && STAGE < MAX_LEVEL);
+  }
+  var __cheatToastT = 0;
+  function cheatToast(msg) {
+    if (!cheatToastEl) return;
+    cheatToastEl.textContent = msg;
+    cheatToastEl.classList.add("show");
+    clearTimeout(__cheatToastT);
+    __cheatToastT = setTimeout(() => cheatToastEl.classList.remove("show"), 1100);
+  }
+  function gotoStage(n) {
+    const t = Math.max(1, Math.min(MAX_LEVEL, n));
+    if (t !== STAGE) location.search = "?stage=" + t;
+  }
+  if (STAGE_FLOW && levelLabelEl) {
+    levelLabelEl.style.cursor = "pointer";
+    let __cc = 0, __ct = 0;
+    levelLabelEl.addEventListener("click", () => {
+      __cc++;
+      clearTimeout(__ct);
+      __ct = setTimeout(() => {
+        __cc = 0;
+      }, 600);
+      if (__cc >= 3) {
+        __cc = 0;
+        clearTimeout(__ct);
+        CHEAT = !CHEAT;
+        lsSet(CHEAT_KEY, CHEAT ? "1" : "0");
+        applyCheatUI();
+        cheatToast(CHEAT ? "\u{1F6E0} CHEAT ON" : "CHEAT OFF");
+      }
+    });
+    if (cheatPrevEl) cheatPrevEl.addEventListener("click", () => gotoStage(STAGE - 1));
+    if (cheatNextEl) cheatNextEl.addEventListener("click", () => gotoStage(STAGE + 1));
+    window.addEventListener("keydown", (e) => {
+      if (!CHEAT) return;
+      if (e.key === "ArrowLeft") gotoStage(STAGE - 1);
+      else if (e.key === "ArrowRight") gotoStage(STAGE + 1);
+    });
+  }
+  function grSnapshot() {
+    return {
+      clearedStages: Math.max(0, (currentLevel | 0) - 1),
+      currentStage: currentLevel | 0,
+      currency: { coins: Wallet.coins | 0 },
+      items: { hints: Wallet.hints | 0 }
+    };
+  }
+  function boot() {
+    preloadPuzzleImages();
+    SFX.init();
+    updateCoinHud();
+    if (GR.active) {
+      GR.provideState(grSnapshot);
+      GR.onState(function(d) {
+        try {
+          if (d && d.currentStage) currentLevel = Math.max(1, Math.min(RT.TOTAL, d.currentStage | 0));
+          if (d && d.currency && typeof d.currency.coins === "number") Wallet.coins = d.currency.coins | 0;
+          if (d && d.items && typeof d.items.hints === "number") {
+            Wallet.hints = d.items.hints | 0;
+            State.hints = Wallet.hints;
+          }
+          saveWallet();
+          updateCoinHud();
+          updateHintBadge();
+          setupLevel(currentLevel);
+        } catch (e) {
+        }
+      });
+    }
+    setupLevel(currentLevel);
+    applyStageLabel();
+    applyCheatUI();
+    requestAnimationFrame(() => {
+      if (GR.active) GR.gameStart();
+    });
+  }
+  boot();
+  if (IS_GRAVITY) {
+    setInterval(() => {
+      if (State.phase === "play" && !State.busy && State.anims.length === 0 && !State.dragging && findCompletePicture()) {
+        State.busy = true;
+        State.phase = "swapping";
+        gravityResolveAfterMove();
+      }
+    }, 400);
+  }
+  window.__PP = {
+    get phase() {
+      return State.phase;
+    },
+    get cells() {
+      return State.cell.slice();
+    },
+    get N() {
+      return State.N;
+    },
+    get cols() {
+      return State.cols;
+    },
+    get rows() {
+      return State.rows;
+    },
+    get level() {
+      return State.level;
+    },
+    get usingPhoto() {
+      return !!(State.puzzleImg && !State.puzzleImg.__procedural);
+    },
+    isComplete,
+    // ── wallet/economy test hooks (STAGE_FLOW) ──
+    get coins() {
+      return Wallet.coins;
+    },
+    get hints() {
+      return State.hints;
+    },
+    get walletHints() {
+      return Wallet.hints;
+    },
+    // set coins/hints for testing (persists to localStorage + refreshes badge/HUD)
+    setWallet(c, h) {
+      if (c != null) {
+        Wallet.coins = c | 0;
+      }
+      if (h != null) {
+        Wallet.hints = h | 0;
+        State.hints = h | 0;
+      }
+      saveWallet();
+      updateHintBadge();
+      updateCoinHud();
+      return { coins: Wallet.coins, hints: Wallet.hints };
+    },
+    shopOpen() {
+      return shopOpen;
+    },
+    openShop() {
+      openHintShop();
+    },
+    buyHints() {
+      return buyHints();
+    },
+    // jump to a specific level (test hook — exercises the difficulty curve)
+    goLevel(l) {
+      currentLevel = l;
+      setupLevel(l);
+    },
+    // load a real picture as the current puzzle image (preview/art-pipeline hook).
+    // Replaces the procedural placeholder; redraws in place. Returns a Promise<bool>.
+    loadPuzzleImage(src) {
+      return new Promise((res) => {
+        const im = new Image();
+        im.onload = () => {
+          State.puzzleImg = im;
+          invalidateStaticCache();
+          drawBoard();
+          res(true);
+        };
+        im.onerror = () => res(false);
+        im.src = src;
+      });
+    },
+    // force a solved board + run the completion sequence (test hook)
+    forceComplete() {
+      if (IS_GRAVITY) {
+        State.cell = new Array(State.N).fill(null);
+        State.deck = Array.from({ length: State.cols }, () => []);
+        State.clearedPics = State.totalPics;
+        State.phase = "play";
+        State.busy = false;
+        drawBoard();
+        onComplete();
+        return;
+      }
+      State.cell = Array.from({ length: State.N }, (_, i) => i);
+      State.tiles.forEach((t) => {
+        t.anim = null;
+        t.faceUp = true;
+        t.reveal = 1;
+      });
+      syncBondProgress();
+      State.phase = "play";
+      drawBoard();
+      onComplete();
+    },
+    // programmatic MOVE (test hook): grab the group at originCell, block-swap so it lands
+    // on targetCell, recompute bonds, merge/praise — exactly the real pointer-up path.
+    move(originCell, targetCell) {
+      if (State.phase !== "play") return false;
+      return resolveMove(originCell, targetCell, 0, 0);
+    },
+    // CAPTURE warm-up hook (marketing): bake one throwaway glow sprite NOW so the first real merge's
+    // shadowBlur-bake + GPU texture upload (a one-time cold-start spike that dropped ~5 frames on the
+    // very first merge) happens during the static scramble hold instead of mid-bounce. Pure offscreen
+    // work + discard — no board/render state change. Returns true if it baked.
+    _warmGlow() {
+      try {
+        const cols = State.cols, rows = State.rows, N = State.N;
+        const shapes = [];
+        const cell = (c, r) => r * cols + c;
+        shapes.push([cell(0, 0)]);
+        if (cols >= 2) shapes.push([cell(0, 0), cell(1, 0)]);
+        if (rows >= 2) shapes.push([cell(0, 0), cell(0, 1)]);
+        if (cols >= 3) shapes.push([cell(0, 0), cell(1, 0), cell(2, 0)]);
+        if (cols >= 2 && rows >= 2) shapes.push([cell(0, 0), cell(1, 0), cell(0, 1), cell(1, 1)]);
+        if (cols >= 3 && rows >= 2) shapes.push([cell(0, 0), cell(1, 0), cell(2, 0), cell(0, 1), cell(1, 1), cell(2, 1)]);
+        let warmed = 0;
+        for (const cells of shapes) {
+          if (cells.some((c) => c >= N)) continue;
+          const fx = { cells, glow: 1, scale: 1, pivot: cellXY(cells[0]), _glowC: null };
+          if (buildGlowSprite(fx)) warmed++;
+          fx._glowC = null;
+        }
+        return warmed;
+      } catch (_) {
+        return 0;
+      }
+    },
+    // CAPTURE hook (marketing): place ONE out-of-place piece into its home (fuse glow), like a hint
+    // but with no hint-count limit — call repeatedly to assemble the photo for recording. false = solved/busy.
+    _solveStep() {
+      if (State.phase !== "play") return false;
+      let pick = -1, best = -1;
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti2 = State.cell[ci];
+        if (ti2 == null || State.tiles[ti2].home === ci) continue;
+        if (groupCellsOf(ci).length !== 1) continue;
+        const home2 = State.tiles[ti2].home, hc = home2 % State.cols, hr = home2 / State.cols | 0;
+        let pot = 0;
+        if (hc > 0 && State.cell[home2 - 1] === home2 - 1) pot++;
+        if (hc < State.cols - 1 && State.cell[home2 + 1] === home2 + 1) pot++;
+        if (hr > 0 && State.cell[home2 - State.cols] === home2 - State.cols) pot++;
+        if (hr < State.rows - 1 && State.cell[home2 + State.cols] === home2 + State.cols) pot++;
+        if (pot > best) {
+          best = pot;
+          pick = ci;
+        }
+      }
+      if (pick < 0) {
+        for (let ci = 0; ci < State.N; ci++) {
+          const ti2 = State.cell[ci];
+          if (ti2 != null && State.tiles[ti2].home !== ci) {
+            pick = ci;
+            break;
+          }
+        }
+      }
+      if (pick < 0) return false;
+      const ti = State.cell[pick], home = State.tiles[ti].home;
+      SFX.resume();
+      resolveMove(pick, home);
+      return true;
+    },
+    // CAPTURE hook: place a RANDOM out-of-place singleton into its home (even, scattered fill — so the
+    // assembled picture doesn't finish biased to one corner). Returns false when solved.
+    _solveStepRandom() {
+      if (State.phase !== "play") return false;
+      const cands = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti2 = State.cell[ci];
+        if (ti2 == null || State.tiles[ti2].home === ci) continue;
+        if (groupCellsOf(ci).length !== 1) continue;
+        cands.push(ci);
+      }
+      if (!cands.length) {
+        for (let ci = 0; ci < State.N; ci++) {
+          const ti2 = State.cell[ci];
+          if (ti2 != null && State.tiles[ti2].home !== ci) {
+            cands.push(ci);
+            break;
+          }
+        }
+      }
+      if (!cands.length) return false;
+      const pick = cands[Math.random() * cands.length | 0];
+      const ti = State.cell[pick], home = State.tiles[ti].home;
+      SFX.resume();
+      resolveMove(pick, home);
+      return true;
+    },
+    // cells in the current group (4-connected bonded component) of the piece at ci
+    groupOf(ci) {
+      return groupCellsOf(ci);
+    },
+    // DEBUG (capture): per-cell {cell, tile, home, grp} so the harness can see what's out-of-place/grouped
+    _cellHomes() {
+      const out = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        out.push(ti == null ? { c: ci, t: null } : { c: ci, t: ti, home: State.tiles[ti].home, grp: groupCellsOf(ci).length });
+      }
+      return out;
+    },
+    // CAPTURE hook (marketing "piece-in-hand pondering"): pick an out-of-place singleton to DRAG, its
+    // correct HOME cell, and a couple of DECOY cells (wrong but plausible spots) to hover over with a
+    // pause before placing — so a real pointer-drag can show deliberation. Returns null if none.
+    _pickDragMove() {
+      if (State.phase !== "play") return null;
+      const cands = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null || State.tiles[ti].home === ci) continue;
+        if (groupCellsOf(ci).length !== 1) continue;
+        cands.push(ci);
+      }
+      if (!cands.length) return null;
+      const from = cands[Math.random() * cands.length | 0];
+      const home = State.tiles[State.cell[from]].home;
+      const others = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        if (ci !== from && ci !== home && State.cell[ci] != null) others.push(ci);
+      }
+      const decoys = [];
+      for (let k = 0; k < 2 && others.length; k++) {
+        decoys.push(others.splice(Math.random() * others.length | 0, 1)[0]);
+      }
+      return { from, home, decoys };
+    },
+    // CAPTURE hook (marketing hand-drag): pick the out-of-place singleton whose HOME cell already has the
+    // MOST correctly-placed neighbours, so dragging it home visibly FUSES (forms ≥1 new bond → a synced
+    // paper-snap). Same {from,home,decoys} shape. Returns null only when nothing is draggable. This keeps
+    // the assembly satisfying (steady merges) while still being a real hand-drag of every piece.
+    _pickDragBond() {
+      if (State.phase !== "play") return null;
+      const cols = State.cols, rows = State.rows;
+      const homeCorrect = (ci) => {
+        const t = State.cell[ci];
+        return t != null && State.tiles[t].home === ci;
+      };
+      let pick = -1, best = -2;
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null || State.tiles[ti].home === ci) continue;
+        if (groupCellsOf(ci).length !== 1) continue;
+        const home2 = State.tiles[ti].home, hc = home2 % cols, hr = home2 / cols | 0;
+        let pot = 0;
+        if (hc > 0 && homeCorrect(home2 - 1)) pot++;
+        if (hc < cols - 1 && homeCorrect(home2 + 1)) pot++;
+        if (hr > 0 && homeCorrect(home2 - cols)) pot++;
+        if (hr < rows - 1 && homeCorrect(home2 + cols)) pot++;
+        if (pot > best) {
+          best = pot;
+          pick = ci;
+        }
+      }
+      if (pick < 0) return null;
+      const home = State.tiles[State.cell[pick]].home;
+      const others = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        if (ci !== pick && ci !== home && State.cell[ci] != null && !homeCorrect(ci)) others.push(ci);
+      }
+      const decoys = [];
+      for (let k = 0; k < 2 && others.length; k++) {
+        decoys.push(others.splice(Math.random() * others.length | 0, 1)[0]);
+      }
+      return { from: pick, home, decoys, pot: best };
+    },
+    // CAPTURE hook (marketing hand-drag — GROUP-AWARE completion): like _pickDragBond but ALSO handles
+    // out-of-place GROUPS (pieces that fused in the WRONG location). Returns a {from, home} where dragging
+    // the piece at `from` (and its whole group) so `from` lands on `home` advances the solve. Guarantees a
+    // hand-drag is always available until truly complete (so the capture never has to force-jump). The
+    // `target` it returns is the CELL the dragged piece should land on (= its own home), clamped by the
+    // engine. Returns null only when the board is solved.
+    _pickDragAny() {
+      if (State.phase !== "play") return null;
+      const sb = this._pickDragBond();
+      if (sb) return sb;
+      let bestGroup = null, bestSize = 0;
+      const seen = /* @__PURE__ */ new Set();
+      for (let ci = 0; ci < State.N; ci++) {
+        if (seen.has(ci)) continue;
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        const g = groupCellsOf(ci);
+        for (const c of g) seen.add(c);
+        const outOfPlace = g.some((c) => State.tiles[State.cell[c]].home !== c);
+        if (outOfPlace && g.length > bestSize) {
+          bestSize = g.length;
+          bestGroup = g;
+        }
+      }
+      if (!bestGroup) return null;
+      let from = bestGroup[0], home = State.tiles[State.cell[from]].home, far = -1;
+      for (const c of bestGroup) {
+        const h = State.tiles[State.cell[c]].home;
+        const d = Math.abs(c % State.cols - h % State.cols) + Math.abs((c / State.cols | 0) - (h / State.cols | 0));
+        if (d > far) {
+          far = d;
+          from = c;
+          home = h;
+        }
+      }
+      return { from, home, decoys: [], pot: 0, group: true };
+    },
+    // CAPTURE hook (marketing tempo): how many pieces currently sit in their HOME cell (correctly placed).
+    // Drives the human-tempo ramp: progress p = placedCount / N.
+    placedCount() {
+      let n = 0;
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti != null && State.tiles[ti].home === ci) n++;
+      }
+      return n;
+    },
+    // number of bonded seams currently on the board
+    bondCount,
+    // client (CSS px) centre of a cell — for real-pointer-drag tests
+    cellCenter(ci) {
+      const p = cellXY(ci);
+      const r = boardCanvas.getBoundingClientRect();
+      return { x: r.left + (p.x + p.w / 2) * (r.width / boardCanvas.width), y: r.top + (p.y + p.h / 2) * (r.height / boardCanvas.height) };
+    },
+    // hit-test a client point → cell index (diagnostic: verifies the pointer→cell mapping under any render scale)
+    _cellAtClient(cx, cy) {
+      const l = toLocal(cx, cy);
+      return cellAtPoint(l.x, l.y);
+    },
+    // true ON-SCREEN centre of a cell (accounts for the actual rendered scale, not the nominal /DPR)
+    _cellVisualCenter(ci) {
+      const p = cellXY(ci);
+      const r = boardCanvas.getBoundingClientRect();
+      return { x: r.left + (p.x + p.w / 2) * (r.width / boardCanvas.width), y: r.top + (p.y + p.h / 2) * (r.height / boardCanvas.height) };
+    },
+    // peek at currently-animating tiles' per-edge bond progress (test hook for the move-flash fix)
+    _movingEdges() {
+      const out = [];
+      for (let ti = 0; ti < State.tiles.length; ti++) {
+        const a = State.tiles[ti] && State.tiles[ti].anim;
+        if (a && a.edges) out.push({ home: ti, cell: State.cell.indexOf(ti), edges: a.edges });
+      }
+      return out;
+    },
+    get _fxGlow() {
+      return State.fx ? State.fx.glow : 0;
+    },
+    // test hook: current fuse-glow alpha (for parity capture)
+    cfg: CFG,
+    // ── GRAVITY-mode QA hooks (no-op-ish in single mode) ──
+    mode: MODE,
+    grav: GRAV,
+    get clearedPics() {
+      return State.clearedPics;
+    },
+    get totalPics() {
+      return State.totalPics;
+    },
+    get busy() {
+      return State.busy;
+    },
+    // per-cell {picId,sub} map of the play grid (null where empty) — inspect the board
+    gravBoard() {
+      return State.cell.map((ti) => ti == null ? null : { picId: State.tiles[ti].picId, sub: State.tiles[ti].sub });
+    },
+    // per-column deck depths (number of face-down upcoming cards waiting)
+    deckDepths() {
+      return (State.deck || []).map((s) => s.length);
+    },
+    totalDeckCards() {
+      return (State.deck || []).reduce((n, s) => n + s.length, 0);
+    },
+    // number of EMPTY play cells right now
+    emptyCells() {
+      let n = 0;
+      for (let ci = 0; ci < State.N; ci++) if (State.cell[ci] == null) n++;
+      return n;
+    },
+    // is there a completed 2×2 picture on the board right now?
+    hasCompletePicture() {
+      return !!findCompletePicture();
+    },
+    // test hooks: force a near-win state (empty deck + clearedPics) and inspect floating columns
+    _emptyDeck() {
+      State.deck = Array.from({ length: State.cols }, () => []);
+    },
+    _setCleared(n) {
+      State.clearedPics = n;
+    },
+    _setReshuffle(b) {
+      __reshuffleOn = !!b;
+    },
+    // tests turn OFF the deadlock auto-shuffle
+    _solvable() {
+      return gravBoardSolvable();
+    },
+    reshuffleCount() {
+      return __reshuffleCount;
+    },
+    // QA: deadlock auto-reshuffles this stage
+    _forceResolve() {
+      if (IS_GRAVITY) {
+        State.phase = "swapping";
+        gravityResolveAfterMove();
+      }
+    },
+    _floatingCols() {
+      const out = [];
+      for (let col = 0; col < State.cols; col++) {
+        let seenEmpty = false, floats = false;
+        for (let r = State.rows - 1; r >= 0; r--) {
+          const ti = State.cell[r * State.cols + col];
+          if (ti == null) seenEmpty = true;
+          else if (seenEmpty) floats = true;
+        }
+        if (floats) out.push(col);
+      }
+      return out;
+    },
+    // find the 4 play cells holding picture `picId` (any positions), or null if not all on board
+    gravCellsOfPic(picId) {
+      const out = [null, null, null, null];
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        const t = State.tiles[ti];
+        if (t.picId === picId) out[t.sub] = ci;
+      }
+      return out.some((c) => c == null) ? null : out;
+    },
+    // DETERMINISTIC test driver: assemble picture `picId` into a 2×2 block at the lowest free
+    // region by directly arranging cells, then run the real clear→gravity→feed resolve. Uses the
+    // engine's resolve path (clear pop + glow + SFX, column gravity, deck feed, win-check).
+    gravComplete(picId) {
+      if (!IS_GRAVITY || State.phase !== "play" || State.busy) return false;
+      const cells = this.gravCellsOfPic(picId);
+      if (!cells) return false;
+      const cols = State.cols, rows = State.rows;
+      const tlRow = rows - 2, tlCol = 0;
+      const tl = tlRow * cols + tlCol, tr = tl + 1, bl = tl + cols, br = bl + 1;
+      const want = [tl, tr, bl, br];
+      const before = State.cell.slice();
+      const picTileSlots = new Set(cells.map((c) => before[c]));
+      const result = before.slice();
+      for (let k = 0; k < 4; k++) result[want[k]] = before[cells[k]];
+      const wantSet = new Set(want);
+      const freed = cells.filter((c) => !wantSet.has(c));
+      const displaced = want.filter((c) => !picTileSlots.has(before[c]));
+      displaced.forEach((c, i) => {
+        result[freed[i]] = before[c];
+      });
+      State.cell = result;
+      syncBondProgress();
+      State.busy = true;
+      State.phase = "swapping";
+      drawBoard();
+      gravityResolveAfterMove();
+      return true;
+    },
+    // TEST: arrange `picId` into a completed 2×2 but DELIBERATELY do NOT resolve — leaves a stuck
+    // completed picture in 'play' phase (reproduces the last-picture freeze bug). The gravity WATCHDOG
+    // must then auto-resolve it. Used by _repro_gravity_win.mjs to verify the fix.
+    _stuckCompleteForTest(picId) {
+      if (!IS_GRAVITY) return false;
+      const cells = this.gravCellsOfPic(picId);
+      if (!cells) return false;
+      const cols = State.cols, rows = State.rows;
+      const tl = (rows - 2) * cols, want = [tl, tl + 1, tl + cols, tl + cols + 1];
+      const before = State.cell.slice();
+      const picTileSlots = new Set(cells.map((c) => before[c]));
+      const result = before.slice();
+      for (let k = 0; k < 4; k++) result[want[k]] = before[cells[k]];
+      const wantSet = new Set(want);
+      const freed = cells.filter((c) => !wantSet.has(c));
+      const displaced = want.filter((c) => !picTileSlots.has(before[c]));
+      displaced.forEach((c, i) => {
+        result[freed[i]] = before[c];
+      });
+      State.cell = result;
+      syncBondProgress();
+      State.busy = false;
+      State.phase = "play";
+      drawBoard();
+      return true;
+    },
+    // ── glow / pop inspection hooks (verify the fuse-emphasis fixes) ──
+    // the live glow halo target: which cells are glowing right now (null when idle)
+    _fx() {
+      return State.fx ? { cells: State.fx.cells.slice(), glow: State.fx.glow, scale: State.fx.scale } : null;
+    },
+    // cells currently ENLARGED (anim.pivot set → the popped block), with their scale
+    _popCells() {
+      const out = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        const a = State.tiles[ti].anim;
+        if (a && a.pivot && a.scale != null) out.push({ cell: ci, scale: +a.scale.toFixed(3) });
+      }
+      return out;
+    },
+    // cells deferred to the TOP draw pass right now (grabbed/moved block via anim.top, or enlarged via anim.pivot)
+    _topCells() {
+      const out = [];
+      for (let ci = 0; ci < State.N; ci++) {
+        const ti = State.cell[ci];
+        if (ti == null) continue;
+        const a = State.tiles[ti].anim;
+        if (a && (a.pivot || a.top)) out.push(ci);
+      }
+      return out;
+    },
+    // largest tile scale on the board right now (1 = no zoom) — to count zoom pulses over time
+    _maxScale() {
+      let s = 1;
+      for (const t of State.tiles) {
+        const a = t && t.anim;
+        if (a && a.scale > s) s = a.scale;
+      }
+      return +s.toFixed(3);
+    },
+    // tile index holding (picId,sub), or -1
+    _findTile(picId, sub) {
+      for (let i = 0; i < State.tiles.length; i++) {
+        const t = State.tiles[i];
+        if (t && t.picId === picId && t.sub === sub) return i;
+      }
+      return -1;
+    },
+    // directly set the play grid to a tile-index permutation (test arrangement only)
+    _setCells(arr) {
+      State.anims.length = 0;
+      State.fx = null;
+      for (const t of State.tiles) {
+        if (t) t.anim = null;
+      }
+      State.cell = arr.slice();
+      syncBondProgress();
+      State.phase = "play";
+      State.busy = false;
+      drawBoard();
+    },
+    // distinct picIds present on the board
+    _picIds() {
+      const s = /* @__PURE__ */ new Set();
+      for (const t of State.tiles) {
+        if (t) s.add(t.picId);
+      }
+      return [...s].sort((a, b) => a - b);
+    },
+    get boardW() {
+      return State.boardW;
+    },
+    get boardH() {
+      return State.boardH;
+    },
+    get deckOffY() {
+      return State.deckOffY;
+    },
+    get pad() {
+      return State.pad;
+    },
+    get canvasW() {
+      return boardCanvas.width;
+    },
+    get canvasH() {
+      return boardCanvas.height;
+    },
+    get fxOffX() {
+      return State.fxOffX;
+    },
+    get fxOffY() {
+      return State.fxOffY;
+    },
+    // completion-converge geometry (warp check): tile size/gap/converge progress each frame
+    get tileW() {
+      return State.tileW;
+    },
+    get tileH() {
+      return State.tileH;
+    },
+    get gap() {
+      return State.gap;
+    },
+    get gridConverge() {
+      return State.gridConverge;
+    },
+    // fuse-emphasis enlarge counter (double-zoom fix): how many emphasis pops fired since reset
+    _emph() {
+      return __dbgEmph;
+    },
+    _resetEmph() {
+      __dbgEmph = 0;
+    },
+    _cellRect(ci) {
+      return cellXY(ci);
+    }
+  };
+})();
+</script>
+</body>
+</html>

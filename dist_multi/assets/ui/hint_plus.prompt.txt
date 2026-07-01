@@ -1,0 +1,20 @@
+asset: hint_plus.png — "+" badge for top-right of hint button (buy/add more hints)
+method: SVG (vector) -> sharp raster -> fit_sprite. Chosen over AI image gen because
+        the badge must have a PERFECTLY centered plus + crisp tiny rendering (~26-30px);
+        vector guarantees dead-center + small file. Fixes prior off-center text "+".
+
+design:
+  - round circle, warm amber/orange vertical gradient top #ffc24d -> bottom #fb8c00
+    (matches game CTA accent #fd9606)
+  - outer ring #e07600 (slightly darker orange) so it pops on white
+  - upper glossy white radial highlight (cx .5 cy .30)
+  - tight soft drop shadow (#a64b00, dy4, blur5, 40%)
+  - thick pure-white "+" centered at (128,128): arms 108px long, 32px thick, rx12,
+    equal margins all sides
+  - transparent bg, square 1:1, flat clean app-icon style
+
+source: assets/ui/hint_plus.svg (256 viewBox, rendered density 384 -> 512px raster)
+pipeline:
+  1) sharp render svg -> assets/_raw/hint_plus_raw.png (512x512, transparent)
+  2) node tools/lib/fit_sprite.mjs <raw> assets/ui/hint_plus.png --target 256x256 --bg none --pad 0
+final: assets/ui/hint_plus.png  256x256  alpha=yes  ~44KB
